@@ -60,6 +60,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     command::{format_response, parse_command, render_notification},
     config::{ConnectionType, MeshConfig, RadioConfig},
+    link::RadioLink,
     metrics::DeliveryStats,
     presets::resolve_radio,
     send_tracker::{RetryConfig, SendTracker, SentOutcome},
@@ -312,7 +313,7 @@ pub struct MeshTransport {
     /// Holds the newly-constructed `CompanionClient` until `start()` moves it
     /// into the event-loop task.  Wrapped in `Option` so `start()` can `take`
     /// it out; `Mutex` so `start(&self)` can mutate through a shared ref.
-    client_slot: Mutex<Option<CompanionClient>>,
+    client_slot: Mutex<Option<RadioLink>>,
     /// Sending half of the shutdown watch channel.  `stop()` sends `true`;
     /// the event-loop task watches for the change and exits.
     shutdown_tx: watch::Sender<bool>,
@@ -396,7 +397,7 @@ impl Plugin for MeshTransport {
                     mode = ?config.connection_type,
                     "mesh transport: connecting via TCP"
                 );
-                CompanionClient::connect(client_config)
+                RadioLink::Companion(CompanionClient::connect(client_config))
             }
 
             ConnectionType::Serial => {
@@ -417,7 +418,44 @@ impl Plugin for MeshTransport {
                     baud = config.baud_rate,
                     "mesh transport: connecting via serial"
                 );
-                CompanionClient::connect_serial(serial_config)
+                RadioLink::Companion(CompanionClient::connect_serial(serial_config))
+            }
+
+            ConnectionType::Kiss => {
+                let port = config.serial_port.clone().ok_or_else(|| {
+                    PluginError::InvalidConfig(
+                        "connection_type = 'kiss' requires serial_port to be set".into(),
+                    )
+                })?;
+                let kiss_config = meshcore_kiss::client::KissClientConfig {
+                    port: port.clone(),
+                    baud_rate: config.baud_rate,
+                    node_name: host.mesh_node_name().unwrap_or_default(),
+                    latitude_1e6: host
+                        .node_location()
+                        .map_or(0, |(lat, _)| (lat * 1_000_000.0) as i32),
+                    longitude_1e6: host
+                        .node_location()
+                        .map_or(0, |(_, lon)| (lon * 1_000_000.0) as i32),
+                    request_timeout: Duration::from_secs(2),
+                    reconnect_delay_initial: config.reconnect_delay_initial(),
+                    reconnect_delay_max: config.reconnect_delay_max(),
+                    tx_delay_ms: config.kiss.tx_delay_ms,
+                    persistence: config.kiss.persistence,
+                    slot_time_ms: config.kiss.slot_time_ms,
+                    tx_tail_ms: config.kiss.tx_tail_ms,
+                    full_duplex: config.kiss.full_duplex,
+                    flood_scope: config.kiss.flood_scope.clone(),
+                    path_bytes: config.path_hash_mode() + 1,
+                    contacts_path: config.kiss.contacts_path.clone(),
+                    max_contacts: config.kiss.max_contacts,
+                };
+                info!(
+                    port = %port,
+                    baud = config.baud_rate,
+                    "mesh transport: connecting to a KISS modem"
+                );
+                RadioLink::Kiss(meshcore_kiss::client::KissClient::connect(kiss_config))
             }
         };
 
@@ -829,7 +867,7 @@ async fn sync_radio_params_if_configured(
 /// Runs until the shutdown watch fires or the companion client channel closes.
 #[allow(clippy::too_many_arguments)]
 async fn event_loop(
-    mut client: CompanionClient,
+    mut client: RadioLink,
     host: Arc<dyn Host>,
     cmd_tx: mpsc::Sender<OutboundFrame>,
     state: Arc<Mutex<SessionState>>,

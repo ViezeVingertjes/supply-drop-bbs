@@ -49,6 +49,7 @@
 
 pub mod command;
 pub mod config;
+mod link;
 pub mod metrics;
 pub mod presets;
 mod send_tracker;

@@ -12,6 +12,7 @@
 //! | `tcp`             | TCP socket       | yes (default)     |
 //! | `hat`             | TCP socket       | yes (Pi HAT)      |
 //! | `serial`          | USB serial port  | no                |
+//! | `kiss`            | USB serial port  | no                |
 //!
 //! Both `tcp` and `hat` connect to a `CompanionFrameServer` over TCP.
 //! `hat` is operationally identical to `tcp` at the BBS level; the
@@ -45,6 +46,12 @@ pub enum ConnectionType {
     /// the BBS speaks the companion-frame protocol directly.  See
     /// ADR-0013 for the rationale.
     Serial,
+
+    /// Connect directly to a USB device running MeshCore **KISS Modem**
+    /// firmware.  `pymc_core` is not required.  The device is a raw-PHY TNC,
+    /// so the BBS runs the MeshCore node stack itself and delegates every
+    /// cryptographic operation back to the device.  See ADR-0014.
+    Kiss,
 }
 
 /// Radio parameter configuration stored in `[plugins.mesh.radio]`.
@@ -295,6 +302,100 @@ pub struct MeshConfig {
     /// ```
     #[serde(default)]
     pub radio: Option<RadioConfig>,
+
+    /// KISS Modem CSMA and framing parameters.
+    ///
+    /// Only consulted when `connection_type = "kiss"`.  Pushed to the device
+    /// on each connect.
+    ///
+    /// ```toml
+    /// [plugins.mesh.kiss]
+    /// tx_delay_ms = 200
+    /// ```
+    #[serde(default)]
+    pub kiss: KissConfig,
+}
+
+/// CSMA parameters for a KISS Modem device.
+///
+/// The KISS protocol expresses each interval in units of 10 ms, so the
+/// millisecond values here are rounded down to the nearest 10 ms when pushed.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KissConfig {
+    /// Transmitter keyup delay in milliseconds.
+    #[serde(default = "default_tx_delay_ms")]
+    pub tx_delay_ms: u32,
+
+    /// CSMA persistence parameter, 0-255.  Higher transmits sooner once the
+    /// channel is clear.
+    #[serde(default = "default_persistence")]
+    pub persistence: u8,
+
+    /// CSMA slot interval in milliseconds.
+    #[serde(default = "default_slot_time_ms")]
+    pub slot_time_ms: u32,
+
+    /// Post-transmit hold time in milliseconds.
+    #[serde(default = "default_tx_tail_ms")]
+    pub tx_tail_ms: u32,
+
+    /// Bypass CSMA and transmit after the keyup delay.
+    ///
+    /// Leave off for a half-duplex radio, which is every LoRa board this
+    /// supports.
+    #[serde(default)]
+    pub full_duplex: bool,
+
+    /// Flood scope (region) name this node transmits under.
+    ///
+    /// Meshes that scope their traffic make repeaters drop any flooded packet
+    /// whose transport code they cannot reproduce, so a BBS on such a mesh must
+    /// send under the same scope or go unheard. The key is
+    /// `SHA256("#<name>")` truncated to sixteen bytes; a name already starting
+    /// with `#` is used unchanged.
+    ///
+    /// Leave unset on a mesh that does not scope its traffic.
+    ///
+    /// ```toml
+    /// [plugins.mesh.kiss]
+    /// flood_scope = "nl"
+    /// ```
+    #[serde(default)]
+    pub flood_scope: Option<String>,
+
+    /// Where the contact table is kept between runs.
+    ///
+    /// Companion firmware stores contacts in the radio's flash. A KISS modem
+    /// does not, so without this the BBS forgets every node's stored path on
+    /// restart and cannot reply until each node adverts again.
+    ///
+    /// Resolved to `<data_dir>/meshcore-contacts.json` when unset.
+    #[serde(default)]
+    pub contacts_path: Option<std::path::PathBuf>,
+
+    /// How many contacts to keep before evicting the one heard longest ago.
+    ///
+    /// A contact costs roughly two hundred bytes, so the default is a couple of
+    /// megabytes: comfortable on a Raspberry Pi and far above any realistic
+    /// mesh.
+    #[serde(default = "default_max_contacts")]
+    pub max_contacts: usize,
+}
+
+impl Default for KissConfig {
+    fn default() -> Self {
+        Self {
+            tx_delay_ms: default_tx_delay_ms(),
+            persistence: default_persistence(),
+            slot_time_ms: default_slot_time_ms(),
+            tx_tail_ms: default_tx_tail_ms(),
+            full_duplex: false,
+            flood_scope: None,
+            contacts_path: None,
+            max_contacts: default_max_contacts(),
+        }
+    }
 }
 
 impl MeshConfig {
@@ -335,6 +436,7 @@ impl Default for MeshConfig {
             reply_max_attempts: default_reply_max_attempts(),
             workflow_timeout_secs: default_workflow_timeout_secs(),
             advert_on_connect: true,
+            kiss: KissConfig::default(),
             radio: None,
         }
     }
@@ -390,9 +492,103 @@ fn default_true() -> bool {
     true
 }
 
+fn default_max_contacts() -> usize {
+    10_000
+}
+
+fn default_tx_delay_ms() -> u32 {
+    500
+}
+
+fn default_persistence() -> u8 {
+    63
+}
+
+fn default_slot_time_ms() -> u32 {
+    100
+}
+
+fn default_tx_tail_ms() -> u32 {
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kiss_connection_type_parses_with_csma_defaults() {
+        let toml = r#"
+            connection_type = "kiss"
+            serial_port = "/dev/ttyACM0"
+        "#;
+        let config: MeshConfig = toml::from_str(toml).expect("parses");
+        assert_eq!(config.connection_type, ConnectionType::Kiss);
+        assert_eq!(config.baud_rate, 115_200);
+        assert_eq!(config.kiss.tx_delay_ms, 500);
+        assert_eq!(config.kiss.persistence, 63);
+        assert_eq!(config.kiss.slot_time_ms, 100);
+        assert_eq!(config.kiss.tx_tail_ms, 0);
+        assert!(!config.kiss.full_duplex);
+    }
+
+    #[test]
+    fn kiss_section_overrides_only_the_keys_given() {
+        let toml = r#"
+            connection_type = "kiss"
+            serial_port = "/dev/ttyACM0"
+
+            [kiss]
+            tx_delay_ms = 200
+            full_duplex = true
+        "#;
+        let config: MeshConfig = toml::from_str(toml).expect("parses");
+        assert_eq!(config.kiss.tx_delay_ms, 200);
+        assert!(config.kiss.full_duplex);
+        assert_eq!(config.kiss.persistence, 63);
+    }
+
+    #[test]
+    fn kiss_contact_persistence_has_sane_defaults() {
+        let config: MeshConfig = toml::from_str("connection_type = \"kiss\"").expect("parses");
+        assert_eq!(config.kiss.max_contacts, 10_000);
+        assert_eq!(config.kiss.contacts_path, None);
+    }
+
+    #[test]
+    fn kiss_contact_persistence_is_configurable() {
+        let toml = r#"
+            connection_type = "kiss"
+
+            [kiss]
+            contacts_path = "/var/lib/sdbbs/contacts.json"
+            max_contacts = 250
+        "#;
+        let config: MeshConfig = toml::from_str(toml).expect("parses");
+        assert_eq!(config.kiss.max_contacts, 250);
+        assert_eq!(
+            config.kiss.contacts_path.as_deref(),
+            Some(std::path::Path::new("/var/lib/sdbbs/contacts.json"))
+        );
+    }
+
+    #[test]
+    fn kiss_section_rejects_an_unknown_key() {
+        let toml = r#"
+            connection_type = "kiss"
+
+            [kiss]
+            tx_delay_millis = 200
+        "#;
+        assert!(toml::from_str::<MeshConfig>(toml).is_err());
+    }
+
+    #[test]
+    fn other_connection_types_keep_the_kiss_defaults() {
+        let config: MeshConfig = toml::from_str("connection_type = \"tcp\"").expect("parses");
+        assert_eq!(config.connection_type, ConnectionType::Tcp);
+        assert_eq!(config.kiss, KissConfig::default());
+    }
 
     /// Reply retransmission is opt-in: the default must stay `1` so a link that
     /// never returns an end-to-end delivery confirmation can't duplicate every

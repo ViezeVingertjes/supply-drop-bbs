@@ -99,6 +99,11 @@ impl Config {
             self.plugins.cli.socket = Some(data_dir.join("cli.sock"));
         }
 
+        #[cfg(feature = "transport-mesh")]
+        if self.plugins.mesh.kiss.contacts_path.is_none() {
+            self.plugins.mesh.kiss.contacts_path = Some(data_dir.join("meshcore-contacts.json"));
+        }
+
         self
     }
 }
@@ -665,4 +670,32 @@ pub fn load(explicit_path: Option<&std::path::Path>) -> Result<Config, ConfigErr
     figment = figment.merge(Env::prefixed("SUPPLY_DROP__").split("__"));
 
     Ok(figment.extract::<Config>()?.resolve())
+}
+
+#[cfg(all(test, feature = "transport-mesh"))]
+mod kiss_contacts_resolve_tests {
+    use super::*;
+
+    #[test]
+    fn kiss_contacts_path_defaults_under_the_data_dir() {
+        let mut cfg = Config::default();
+        cfg.bbs.data_dir = Some(PathBuf::from("/srv/bbs"));
+        let resolved = cfg.resolve();
+        assert_eq!(
+            resolved.plugins.mesh.kiss.contacts_path.as_deref(),
+            Some(std::path::Path::new("/srv/bbs/meshcore-contacts.json"))
+        );
+    }
+
+    #[test]
+    fn an_explicit_kiss_contacts_path_is_left_alone() {
+        let mut cfg = Config::default();
+        cfg.bbs.data_dir = Some(PathBuf::from("/srv/bbs"));
+        cfg.plugins.mesh.kiss.contacts_path = Some(PathBuf::from("/elsewhere/contacts.json"));
+        let resolved = cfg.resolve();
+        assert_eq!(
+            resolved.plugins.mesh.kiss.contacts_path.as_deref(),
+            Some(std::path::Path::new("/elsewhere/contacts.json"))
+        );
+    }
 }
