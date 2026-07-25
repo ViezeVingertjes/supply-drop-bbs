@@ -295,11 +295,13 @@ dependencies = [
  "bbs-core",
  "bbs-plugin-api",
  "meshcore-companion",
+ "meshcore-kiss",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "toml",
  "tracing",
 ]
 
@@ -1446,6 +1448,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "meshcore-kiss"
+version = "0.12.0"
+dependencies = [
+ "meshcore-companion",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-serial",
+ "tracing",
+]
+
+[[package]]
 name = "mimalloc"
 version = "0.1.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2544,6 +2561,7 @@ dependencies = [
  "dirs",
  "figment",
  "meshcore-companion",
+ "meshcore-kiss",
  "mimalloc",
  "serde",
  "sysinfo",

@@ -22,7 +22,7 @@ path = "src/main.rs"
 [features]
 default               = ["transport-cli", "transport-mesh", "transport-meshtastic", "admin-web", "transport-process"]
 transport-cli         = ["dep:bbs-cli"]
-transport-mesh        = ["dep:bbs-mesh", "dep:meshcore-companion"]
+transport-mesh        = ["dep:bbs-mesh", "dep:meshcore-companion", "dep:meshcore-kiss"]
 transport-meshtastic  = ["dep:bbs-meshtastic"]
 admin-web             = ["dep:bbs-web"]
 transport-process     = ["dep:bbs-process-transport"]
@@ -37,6 +37,7 @@ bbs-meshtastic       = { workspace = true, optional = true }
 bbs-web              = { workspace = true, optional = true }
 bbs-process-transport = { workspace = true, optional = true }
 meshcore-companion   = { workspace = true, optional = true }
+meshcore-kiss        = { workspace = true, optional = true }
 clap.workspace            = true
 dirs.workspace            = true
 figment.workspace         = true
@@ -81,6 +82,7 @@ bbs-meshtastic        = { path = "crates/bbs-meshtastic",        version = "0.12
 bbs-web               = { path = "crates/bbs-web",              version = "0.12.0" }
 bbs-process-transport = { path = "crates/bbs-process-transport", version = "0.12.0" }
 meshcore-companion    = { path = "crates/meshcore-companion",    version = "0.12.0" }
+meshcore-kiss         = { path = "crates/meshcore-kiss",         version = "0.12.0" }
 
 # Third-party deps. We use loose version constraints (semver-major)
 # so cargo can pick patch updates; the lockfile pins the exact
