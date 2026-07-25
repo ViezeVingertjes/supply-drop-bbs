@@ -259,14 +259,51 @@ pub fn resolve_radio(
         pwr = Some(v);
     }
 
-    Ok(ResolvedRadio {
+    let resolved = ResolvedRadio {
         frequency_hz: freq
             .ok_or("frequency_hz not set — specify a preset or frequency_hz in config")?,
         bandwidth_hz: bw.ok_or("bandwidth_hz not set")?,
         spreading_factor: sf.ok_or("spreading_factor not set")?,
         coding_rate: cr.ok_or("coding_rate not set")?,
         tx_power_dbm: pwr.ok_or("tx_power_dbm not set")?,
-    })
+    };
+    check_in_range(&resolved)?;
+    Ok(resolved)
+}
+
+/// Reject radio parameters that cannot work on any supported board.
+///
+/// These values are pushed to the device on every connect, and writing an
+/// impossible one leaves the node deaf and silent until an operator notices and
+/// corrects it by hand. The commonest way to get there is a frequency typed in
+/// megahertz: `869.618` becomes `869`, which the radio accepts as 869 Hz.
+///
+/// The bounds are the SX126x tuning range and the LoRa parameter ranges
+/// MeshCore itself uses, so anything outside them could not have worked.
+fn check_in_range(radio: &ResolvedRadio) -> Result<(), String> {
+    if !(137_000_000..=1_020_000_000).contains(&radio.frequency_hz) {
+        return Err(format!(
+            "frequency_hz {} is outside 137000000-1020000000; the value is in hertz, \
+             so 869.618 MHz is 869618000",
+            radio.frequency_hz
+        ));
+    }
+    if !(7_800..=500_000).contains(&radio.bandwidth_hz) {
+        return Err(format!(
+            "bandwidth_hz {} is outside 7800-500000",
+            radio.bandwidth_hz
+        ));
+    }
+    if !(5..=12).contains(&radio.spreading_factor) {
+        return Err(format!(
+            "spreading_factor {} is outside 5-12",
+            radio.spreading_factor
+        ));
+    }
+    if !(5..=8).contains(&radio.coding_rate) {
+        return Err(format!("coding_rate {} is outside 5-8", radio.coding_rate));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -281,6 +318,54 @@ mod tests {
         assert_eq!(r.spreading_factor, 7);
         assert_eq!(r.coding_rate, 5);
         assert_eq!(r.tx_power_dbm, 20);
+    }
+
+    #[test]
+    fn a_frequency_typed_in_megahertz_is_rejected() {
+        let cfg = RadioConfig {
+            preset: Some("EU/UK (Narrow)".into()),
+            frequency_hz: Some(869),
+            ..RadioConfig::default()
+        };
+        let err = resolve_radio(Some(&cfg), None, None, None, None, None, None)
+            .expect_err("869 Hz must be rejected");
+        assert!(err.contains("869618000"), "{err}");
+    }
+
+    #[test]
+    fn out_of_range_parameters_are_rejected() {
+        let base = RadioConfig {
+            preset: Some("EU/UK (Narrow)".into()),
+            ..RadioConfig::default()
+        };
+        let cases = [
+            RadioConfig {
+                bandwidth_hz: Some(1_000_000),
+                ..base.clone()
+            },
+            RadioConfig {
+                spreading_factor: Some(13),
+                ..base.clone()
+            },
+            RadioConfig {
+                coding_rate: Some(9),
+                ..base.clone()
+            },
+        ];
+        for cfg in cases {
+            assert!(resolve_radio(Some(&cfg), None, None, None, None, None, None).is_err());
+        }
+    }
+
+    #[test]
+    fn every_shipped_preset_is_in_range() {
+        for preset in REGION_PRESETS {
+            assert!(
+                resolve_radio(None, Some(preset.name), None, None, None, None, None).is_ok(),
+                "preset {} is out of range",
+                preset.name
+            );
+        }
     }
 
     #[test]
