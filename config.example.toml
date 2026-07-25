@@ -176,12 +176,46 @@
 #   "hat"    — same as tcp; the setup wizard offers Pi HAT GPIO/SPI hints
 #   "serial" — connect directly to a USB companion device (Heltec V3,
 #              T-Beam, RAK4631, etc.) — no pymc_core required (ADR-0013)
+#   "kiss"   — connect directly to a USB device running MeshCore KISS
+#              Modem firmware — no pymc_core required (ADR-0014)
 # connection_type = "tcp"
 
 # ── Serial mode (connection_type = "serial") ──────────────────────
 # Serial device. The setup wizard detects and sets this automatically.
 # serial_port = "/dev/ttyACM0"
 # baud_rate = 115200
+
+# ── KISS mode (connection_type = "kiss") ──────────────────────────
+# Uses the same serial_port and baud_rate as serial mode above. The
+# device is a raw-PHY TNC, so the BBS runs the MeshCore node stack
+# itself. See docs/CONFIG.md for the full key reference.
+#
+# NOTE: the node identity lives in the device's flash and cannot be
+# exported, so it cannot be moved to a replacement board.
+#
+# [plugins.mesh.kiss]
+# Transmitter keyup delay, rounded down to the KISS 10 ms unit.
+# tx_delay_ms = 500
+# CSMA persistence, 0-255.
+# persistence = 63
+# CSMA slot interval, rounded down to the KISS 10 ms unit.
+# slot_time_ms = 100
+# Post-transmit hold time, rounded down to the KISS 10 ms unit.
+# tx_tail_ms = 0
+# Bypass CSMA. Leave off for a half-duplex radio.
+# full_duplex = false
+# Region name for meshes that scope their traffic. Repeaters on a
+# scoped mesh drop flooded packets whose transport code they cannot
+# reproduce, so the BBS must transmit under the same scope to be
+# heard. Leave unset on an unscoped mesh. A leading "#" is added
+# automatically, so "nl" and "#nl" are the same scope.
+# flood_scope = "nl"
+# Where the contact table is kept between runs. A KISS modem does not
+# store contacts itself, so without this the BBS forgets every node's
+# return path on restart. Defaults to <data_dir>/meshcore-contacts.json.
+# contacts_path = "/var/lib/supply-drop-bbs/meshcore-contacts.json"
+# Contacts to keep before evicting the one heard longest ago.
+# max_contacts = 10000
 
 # ── TCP / HAT mode (connection_type = "tcp" or "hat") ─────────────
 # Address of the pymc_core CompanionFrameServer.

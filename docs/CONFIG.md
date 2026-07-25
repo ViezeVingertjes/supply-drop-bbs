@@ -261,7 +261,7 @@ no-silent-overrides rule.
 | Key                | Type   | Default    | Required | Description                                  |
 |--------------------|--------|------------|----------|----------------------------------------------|
 | `enabled`          | bool   | `true`     | no       | Whether to start the mesh transport          |
-| `connection_type`  | enum   | `"serial"` | no       | How to reach the radio: `"serial"`, `"tcp"`, or `"hat"`. See [ADR-0013](adr/0013-native-serial-transport-for-usb-devices.md). |
+| `connection_type`  | enum   | `"serial"` | no       | How to reach the radio: `"serial"`, `"tcp"`, `"hat"`, or `"kiss"`. See [ADR-0013](adr/0013-native-serial-transport-for-usb-devices.md) and [ADR-0014](adr/0014-native-meshcore-stack-for-kiss-modems.md). |
 | `command_prefix`   | string | `""`       | no       | Optional single-character prefix for BBS commands (e.g., `"!"`). Empty string means no prefix - every message is treated as a command. |
 
 ### Reply delivery
@@ -307,6 +307,56 @@ run companion-frame firmware. No `pymc_core` required.
 |---------------|---------|------------------|----------|------------------------------------------|
 | `serial_port` | string  | `"/dev/ttyACM0"` | no       | Serial device path. The setup wizard auto-detects this. |
 | `baud_rate`   | integer | `115200`         | no       | Serial baud rate                         |
+
+### KISS mode (`connection_type = "kiss"`)
+
+Used for USB devices running MeshCore **KISS Modem** firmware. No `pymc_core`
+required. The device is a raw-PHY TNC, so the BBS runs the MeshCore node stack
+itself and delegates every cryptographic operation back to the device. See
+[ADR-0014](adr/0014-native-meshcore-stack-for-kiss-modems.md).
+
+Uses the same `serial_port` and `baud_rate` keys as serial mode.
+
+Companion firmware keeps its contact table in the radio's flash; a KISS modem
+does not, so the BBS persists contacts itself to `contacts_path`. Without it the
+BBS would forget every node's stored return path on restart and could not reply
+until each node adverted again. The file is rewritten at most every 30 seconds
+and only when something changed, so it does not hammer an SD card. When the
+table is full the contact heard longest ago is evicted first. Cached shared
+secrets are never written to disk; they are re-derived on demand.
+
+The node's identity lives in the device's flash. The KISS firmware exposes no
+private-key export, so a KISS-mode identity cannot be backed up or moved to a
+replacement board, and `node export-key` / `node import-key` refuse rather than
+operate on a different key.
+
+CSMA and scope settings live in their own table:
+
+| Key            | Type    | Default | Required | Description                              |
+|----------------|---------|---------|----------|------------------------------------------|
+| `tx_delay_ms`  | integer | `500`   | no       | Transmitter keyup delay. Rounded down to the KISS 10 ms unit. |
+| `persistence`  | integer | `63`    | no       | CSMA persistence, 0-255. Higher transmits sooner once the channel is clear. |
+| `slot_time_ms` | integer | `100`   | no       | CSMA slot interval. Rounded down to the KISS 10 ms unit. |
+| `tx_tail_ms`   | integer | `0`     | no       | Post-transmit hold time. Rounded down to the KISS 10 ms unit. |
+| `full_duplex`  | bool    | `false` | no       | Bypass CSMA. Leave off for a half-duplex radio, which is every supported LoRa board. |
+| `flood_scope`  | string  | (unset) | no       | Region name for meshes that scope their traffic. Also settable via the web admin **Settings → MeshCore radio** page. |
+| `contacts_path`| path    | `<data_dir>/meshcore-contacts.json` | no | Where the contact table is kept between runs. |
+| `max_contacts` | integer | `10000` | no       | Contacts to keep before evicting the one heard longest ago. |
+
+`flood_scope` matters on a mesh that scopes its traffic: repeaters there drop any
+flooded packet whose transport code they cannot reproduce, so the BBS must
+transmit under the same scope to be heard at all. The key is `SHA256("#<name>")`
+truncated to sixteen bytes, so `flood_scope = "nl"` and `flood_scope = "#nl"`
+are the same scope. Leave it unset on an unscoped mesh.
+
+```toml
+[plugins.mesh]
+connection_type = "kiss"
+serial_port     = "/dev/ttyACM0"
+
+[plugins.mesh.kiss]
+flood_scope = "nl"
+```
 
 ### TCP / HAT mode (`connection_type = "tcp"` or `"hat"`)
 
