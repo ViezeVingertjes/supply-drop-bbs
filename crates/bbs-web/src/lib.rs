@@ -1829,6 +1829,10 @@ struct RadioConfigResponse {
     /// `None` means "not set in file" (the transport still applies its own
     /// default of 3).
     path_bytes: Option<u8>,
+    /// Flood scope name from `[plugins.mesh.kiss]`, for meshes that require a
+    /// transport code on flooded packets. `None` means the mesh is unscoped.
+    /// Applies to KISS Modem connections only.
+    flood_scope: Option<String>,
     /// Full preset details for populating the UI dropdown and auto-filling fields.
     presets: Vec<RadioPresetDetail>,
 }
@@ -1852,6 +1856,9 @@ struct RadioConfigPatch {
     /// Routing path-hash width in bytes: `2` or `3`. JSON null clears it (falls
     /// back to the transport's default of 3).
     path_bytes: Option<serde_json::Value>,
+    /// Flood scope name for meshes that require transport codes. JSON null
+    /// clears it. KISS Modem connections only.
+    flood_scope: Option<serde_json::Value>,
 }
 
 /// Editable subset of the BBS configuration, returned by GET /api/v1/config.
@@ -2248,6 +2255,53 @@ fn doc_remove_mesh_field(doc: &mut toml_edit::DocumentMut, key: &str) {
             }
         }
     }
+}
+
+/// Set a key inside `[plugins.mesh.kiss]`, creating the tables it needs.
+fn doc_set_kiss_field(doc: &mut toml_edit::DocumentMut, key: &str, val: toml_edit::Value) {
+    if doc.get("plugins").is_none() {
+        doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let plugins = doc["plugins"].as_table_mut().expect("plugins is a table");
+    if plugins.get("mesh").is_none() {
+        plugins.insert("mesh", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let mesh = plugins
+        .get_mut("mesh")
+        .and_then(|m| m.as_table_mut())
+        .expect("mesh is a table");
+    if mesh.get("kiss").is_none() {
+        mesh.insert("kiss", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let kiss = mesh
+        .get_mut("kiss")
+        .and_then(|k| k.as_table_mut())
+        .expect("kiss is a table");
+    kiss.insert(key, toml_edit::Item::Value(val));
+}
+
+/// Remove a key from `[plugins.mesh.kiss]` if the table path exists.
+fn doc_remove_kiss_field(doc: &mut toml_edit::DocumentMut, key: &str) {
+    if let Some(kiss) = doc
+        .get_mut("plugins")
+        .and_then(|p| p.as_table_mut())
+        .and_then(|p| p.get_mut("mesh"))
+        .and_then(|m| m.as_table_mut())
+        .and_then(|m| m.get_mut("kiss"))
+        .and_then(|k| k.as_table_mut())
+    {
+        kiss.remove(key);
+    }
+}
+
+/// Read a string key from `[plugins.mesh.kiss]`.
+fn toml_kiss_string(val: &toml::Value, key: &str) -> Option<String> {
+    val.get("plugins")?
+        .get("mesh")?
+        .get("kiss")?
+        .get(key)?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// Remove a key from a section in a [`toml_edit::DocumentMut`], if it exists.
@@ -2676,6 +2730,7 @@ async fn api_get_radio_config(
         connection_type,
         serial_port,
         path_bytes: toml_plugin_u8(&val, "mesh", "path_bytes"),
+        flood_scope: toml_kiss_string(&val, "flood_scope"),
         presets: RADIO_PRESETS.to_vec(),
     })
     .into_response()
@@ -2778,6 +2833,15 @@ async fn api_patch_radio_config(
             doc_set_mesh_field(&mut doc, "path_bytes", toml_edit::Value::from(n));
         }
     }
+    if let Some(v) = patch.flood_scope {
+        if v.is_null() {
+            doc_remove_kiss_field(&mut doc, "flood_scope");
+        } else if let Some(name) = v.as_str().map(str::trim).filter(|n| !n.is_empty()) {
+            doc_set_kiss_field(&mut doc, "flood_scope", toml_edit::Value::from(name));
+        } else {
+            doc_remove_kiss_field(&mut doc, "flood_scope");
+        }
+    }
 
     if let Err(e) = atomic_write_file(std::path::Path::new(&path), doc.to_string().as_bytes()) {
         return (
@@ -2813,6 +2877,7 @@ async fn api_patch_radio_config(
         connection_type: toml_plugin_str(&val, "mesh", "connection_type"),
         serial_port: toml_plugin_str(&val, "mesh", "serial_port"),
         path_bytes: toml_plugin_u8(&val, "mesh", "path_bytes"),
+        flood_scope: toml_kiss_string(&val, "flood_scope"),
         presets: RADIO_PRESETS.to_vec(),
     })
     .into_response()
@@ -4012,5 +4077,91 @@ async fn api_plugin_logs(
     match registry.get_logs(&name, q.lines.min(500)).await {
         Ok(lines) => Json(serde_json::json!({ "lines": lines })).into_response(),
         Err(e) => registry_err(e),
+    }
+}
+
+#[cfg(test)]
+mod config_doc_tests {
+    use super::*;
+
+    fn doc(source: &str) -> toml_edit::DocumentMut {
+        source.parse::<toml_edit::DocumentMut>().expect("parses")
+    }
+
+    #[test]
+    fn setting_the_flood_scope_creates_the_kiss_table() {
+        let mut d = doc("[plugins.mesh]\nenabled = true\n");
+        doc_set_kiss_field(&mut d, "flood_scope", toml_edit::Value::from("nl"));
+
+        let rendered = d.to_string();
+        assert!(rendered.contains("[plugins.mesh.kiss]"), "{rendered}");
+        assert!(rendered.contains("flood_scope = \"nl\""), "{rendered}");
+
+        let parsed: toml::Value = toml::from_str(&rendered).expect("valid toml");
+        assert_eq!(
+            toml_kiss_string(&parsed, "flood_scope").as_deref(),
+            Some("nl")
+        );
+    }
+
+    #[test]
+    fn setting_the_flood_scope_preserves_other_kiss_keys() {
+        let mut d = doc("[plugins.mesh.kiss]\ntx_delay_ms = 200\n");
+        doc_set_kiss_field(&mut d, "flood_scope", toml_edit::Value::from("be"));
+
+        let parsed: toml::Value = toml::from_str(&d.to_string()).expect("valid toml");
+        assert_eq!(
+            toml_kiss_string(&parsed, "flood_scope").as_deref(),
+            Some("be")
+        );
+        assert_eq!(
+            parsed["plugins"]["mesh"]["kiss"]["tx_delay_ms"]
+                .as_integer()
+                .expect("kept"),
+            200
+        );
+    }
+
+    #[test]
+    fn setting_the_flood_scope_twice_overwrites_rather_than_duplicates() {
+        let mut d = doc("[plugins.mesh.kiss]\nflood_scope = \"nl\"\n");
+        doc_set_kiss_field(&mut d, "flood_scope", toml_edit::Value::from("de"));
+
+        let rendered = d.to_string();
+        assert_eq!(rendered.matches("flood_scope").count(), 1, "{rendered}");
+        let parsed: toml::Value = toml::from_str(&rendered).expect("valid toml");
+        assert_eq!(
+            toml_kiss_string(&parsed, "flood_scope").as_deref(),
+            Some("de")
+        );
+    }
+
+    #[test]
+    fn removing_the_flood_scope_clears_it_without_touching_siblings() {
+        let mut d = doc("[plugins.mesh.kiss]\ntx_delay_ms = 200\nflood_scope = \"nl\"\n");
+        doc_remove_kiss_field(&mut d, "flood_scope");
+
+        let parsed: toml::Value = toml::from_str(&d.to_string()).expect("valid toml");
+        assert_eq!(toml_kiss_string(&parsed, "flood_scope"), None);
+        assert_eq!(
+            parsed["plugins"]["mesh"]["kiss"]["tx_delay_ms"]
+                .as_integer()
+                .expect("kept"),
+            200
+        );
+    }
+
+    #[test]
+    fn removing_a_flood_scope_that_was_never_set_is_harmless() {
+        let mut d = doc("[bbs]\nname = \"x\"\n");
+        doc_remove_kiss_field(&mut d, "flood_scope");
+        assert!(toml::from_str::<toml::Value>(&d.to_string()).is_ok());
+    }
+
+    #[test]
+    fn reading_the_flood_scope_from_a_config_without_a_kiss_table_is_none() {
+        let parsed: toml::Value =
+            toml::from_str("[plugins.mesh]\nenabled = true\n").expect("valid toml");
+        assert_eq!(toml_kiss_string(&parsed, "flood_scope"), None);
     }
 }

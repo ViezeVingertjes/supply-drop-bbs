@@ -367,6 +367,7 @@ interface RadioConfigData {
   connection_type: string | null
   serial_port: string | null
   path_bytes: number | null
+  flood_scope: string | null
   presets: RadioPresetDetail[]
 }
 
@@ -388,6 +389,7 @@ const radioTxPowerDbm = ref<string>('')
 // Routing path-hash width (companion-protocol setting, not a physical radio
 // param — applies to every connection type). Always 2 or 3; default 3.
 const radioPathBytes = ref<number>(3)
+const radioFloodScope = ref<string>('')
 
 function applyPreset(name: string) {
   const p = radioPresets.value.find(p => p.name === name)
@@ -412,6 +414,7 @@ async function loadRadioConfig() {
     radioPresets.value = r.presets
     radioPreset.value = r.preset ?? ''
     radioPathBytes.value = r.path_bytes ?? 3
+    radioFloodScope.value = r.flood_scope ?? ''
     // Prefer stored individual values; if none, fall back to preset values
     if (r.frequency_hz != null || r.bandwidth_hz != null || r.spreading_factor != null ||
         r.coding_rate != null || r.tx_power_dbm != null) {
@@ -430,6 +433,43 @@ async function loadRadioConfig() {
   }
 }
 
+/**
+ * Parse one radio field, which is always a whole number in base units.
+ *
+ * A decimal is almost always a value typed in the display unit: 869.618 meant
+ * as MHz truncates to 869, and the radio is then told to tune to 869 Hz.
+ * `suggestScale` is the multiplier from that display unit to the base unit, and
+ * turns the rejection into a usable suggestion.
+ *
+ * @throws when the value is not a whole number, or falls outside min..max.
+ */
+function parseRadioField(
+  raw: string,
+  label: string,
+  min: number,
+  max: number,
+  unit: string,
+  suggestScale?: number,
+): number | null {
+  const text = raw.trim()
+  if (!text) return null
+
+  if (!/^\d+$/.test(text)) {
+    const asNumber = Number(text)
+    const suggestion =
+      suggestScale && Number.isFinite(asNumber) && !Number.isInteger(asNumber)
+        ? ` Did you mean ${Math.round(asNumber * suggestScale)}?`
+        : ''
+    throw new Error(`${label} must be a whole number${unit ? ' of ' + unit : ''}, not "${text}".${suggestion}`)
+  }
+
+  const value = parseInt(text, 10)
+  if (value < min || value > max) {
+    throw new Error(`${label} must be between ${min} and ${max}${unit ? ' ' + unit : ''}; got ${value}.`)
+  }
+  return value
+}
+
 async function saveRadioConfig() {
   radioSaving.value    = true
   radioSaveOk.value    = null
@@ -437,12 +477,13 @@ async function saveRadioConfig() {
   try {
     const patch: Record<string, unknown> = {
       preset:           radioPreset.value || null,
-      frequency_hz:     radioFrequencyHz.value     ? parseInt(radioFrequencyHz.value, 10)     : null,
-      bandwidth_hz:     radioBandwidthHz.value     ? parseInt(radioBandwidthHz.value, 10)     : null,
-      spreading_factor: radioSpreadingFactor.value ? parseInt(radioSpreadingFactor.value, 10) : null,
-      coding_rate:      radioCodingRate.value      ? parseInt(radioCodingRate.value, 10)      : null,
-      tx_power_dbm:     radioTxPowerDbm.value      ? parseInt(radioTxPowerDbm.value, 10)      : null,
+      frequency_hz:     parseRadioField(radioFrequencyHz.value, 'Frequency', 137_000_000, 1_020_000_000, 'Hz', 1_000_000),
+      bandwidth_hz:     parseRadioField(radioBandwidthHz.value, 'Bandwidth', 7_800, 500_000, 'Hz', 1_000),
+      spreading_factor: parseRadioField(radioSpreadingFactor.value, 'Spreading factor', 5, 12, ''),
+      coding_rate:      parseRadioField(radioCodingRate.value, 'Coding rate', 5, 8, ''),
+      tx_power_dbm:     parseRadioField(radioTxPowerDbm.value, 'TX power', 0, 30, 'dBm'),
       path_bytes:       radioPathBytes.value,
+      flood_scope:      radioFloodScope.value.trim() || null,
     }
     const updated = await api.patch<RadioConfigData>('/api/v1/radio-config', patch)
     radioConfig.value = updated
@@ -1228,10 +1269,28 @@ chmod g+w {{ configFile }}</pre>
           </p>
         </div>
 
+        <div class="field">
+          <label>Flood scope</label>
+          <input
+            v-model="radioFloodScope"
+            type="text"
+            placeholder="e.g. nl"
+            :disabled="radioLoading"
+            style="max-width: 220px"
+          />
+          <p class="hint">
+            Region name for meshes that scope their traffic. Repeaters on a scoped
+            mesh drop any flooded packet whose transport code they cannot reproduce,
+            so the BBS must transmit under the same scope to be heard. Leave empty on
+            an unscoped mesh. A leading <code>#</code> is added automatically.
+            KISS Modem connections only.
+          </p>
+        </div>
+
         <div class="field-row">
           <div class="field">
             <label>Frequency (Hz)</label>
-            <input v-model="radioFrequencyHz" type="number" min="1" placeholder="e.g. 910525000" :disabled="radioLoading" />
+            <input v-model="radioFrequencyHz" type="number" min="1" placeholder="e.g. 910525000" step="1" :disabled="radioLoading" />
             <p class="hint">e.g. 910525000 for 910.525 MHz</p>
           </div>
           <div class="field">
