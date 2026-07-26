@@ -252,7 +252,9 @@ Backup created: backup_20260511_142301.db
 supply-drop-bbs node show-key [OPTIONS]
 ```
 
-Connect to the MeshCore companion device via USB serial, perform the handshake, and print the node's 32-byte **public key** as a 64-character hex string. This is the key other mesh nodes use to contact your BBS.
+Connect to the MeshCore device via USB serial, perform the handshake, and print the node's 32-byte **public key** as a 64-character hex string. This is the key other mesh nodes use to contact your BBS.
+
+Works for both `connection_type = "serial"` (companion firmware) and `connection_type = "kiss"` (KISS Modem firmware); the port defaults to `serial_port` in either case.
 
 The BBS service must **not** be running on the same serial port when you run this.
 
@@ -281,6 +283,8 @@ Export the companion device's 32-byte **private key** as a 64-character hex stri
 **Keep the output secret.** Anyone with the private key can impersonate your node.
 
 The BBS service must **not** be running on the same serial port.
+
+> **Not available on KISS Modem devices.** The KISS firmware exposes no way to read the private key, so with `connection_type = "kiss"` this command refuses with an explanatory error rather than connecting. A KISS node's identity cannot be backed up or moved to a replacement board — reflashing gives the BBS a new identity. See [ADR-0014](adr/0014-native-meshcore-stack-for-kiss-modems.md).
 
 ```sh
 supply-drop-bbs node export-key
@@ -312,6 +316,8 @@ supply-drop-bbs node import-key ab12cd34ef56...
 ```
 
 **Exit codes:** `0` on success; `1` if the key is invalid, the port cannot be opened, or the device does not confirm the import.
+
+> **Not available on KISS Modem devices.** The KISS firmware exposes no way to replace the private key, so with `connection_type = "kiss"` this command refuses with an explanatory error. See [ADR-0014](adr/0014-native-meshcore-stack-for-kiss-modems.md).
 
 > **Web admin:** The same operation is available in the Settings page → **Node identity** → click the ✏️ icon next to the public key.
 

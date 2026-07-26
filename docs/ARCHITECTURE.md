@@ -72,9 +72,10 @@ where relevant.
 
 ### 2.1 Process topology
 
-The topology depends on the radio hardware. Both configurations share
-the same Rust binary and config schema; only the `connection_type`
-setting in `[plugins.mesh]` differs.
+The topology depends on the radio hardware and on the firmware the
+device runs. Every configuration shares the same Rust binary and
+config schema; only the `connection_type` setting in `[plugins.mesh]`
+differs.
 
 #### USB device - single process
 
@@ -104,6 +105,42 @@ setting in `[plugins.mesh]` differs.
 
 `bbs-mesh` speaks the companion-frame protocol directly over the USB
 serial port via `meshcore-companion`. No bridge process. No Python.
+
+#### KISS Modem device - single process
+
+A device running MeshCore's **KISS Modem** firmware is a raw-PHY TNC:
+it transmits and receives whole LoRa packets and performs CSMA, but it
+does no routing, keeps no contacts, and decides nothing about
+encryption. The BBS therefore runs the MeshCore node stack itself, in
+`meshcore-kiss`, and delegates every cryptographic operation back to
+the device over the firmware's SetHardware extension.
+
+```
+                  ┌──────────────────────────────┐
+                  │    supply-drop-bbs            │
+                  │                               │
+                  │    ┌─────────────────────┐   │
+                  │    │     bbs-mesh        │   │
+                  │    └──────────┬──────────┘   │
+                  │    ┌──────────┴──────────┐   │ ← packets, routing,
+                  │    │   meshcore-kiss     │   │   paths, contacts,
+                  │    └──────────┬──────────┘   │   dedup, acks
+                  └───────────────┼───────────────┘
+                                  │ KISS framing (USB serial)
+                                  ▼
+                          USB KISS Modem device
+                          ┌──────────────────┐
+                          │ radio + CSMA     │
+                          │ all cryptography │ ← identity, signing,
+                          └──────────────────┘   key exchange, AES,
+                                                 SHA-256, randomness
+```
+
+No cryptography runs on the host. The split, and what it costs, is set
+out in [ADR-0014](adr/0014-native-meshcore-stack-for-kiss-modems.md).
+The most important consequence for an operator: the node identity
+lives in the device's flash and **cannot be exported or moved** to a
+replacement board.
 
 #### Pi HAT - two processes
 
@@ -177,11 +214,19 @@ supply-drop-bbs/
 │   ├── bbs-web/            ← Web admin UI plugin. Opt-in via the
 │   │                         admin-web cargo feature. Embeds the
 │   │                         compiled Vue frontend via rust-embed.
-│   └── meshcore-companion/ ← Pure-Rust client for the
-│                             companion-frame TCP protocol that
-│                             pymc_core's CompanionFrameServer
-│                             speaks. Standalone crate; could be
-│                             published to crates.io eventually.
+│   ├── meshcore-companion/ ← Pure-Rust client for the
+│   │                         companion-frame TCP protocol that
+│   │                         pymc_core's CompanionFrameServer
+│   │                         speaks. Standalone crate; could be
+│   │                         published to crates.io eventually.
+│   └── meshcore-kiss/      ← Pure-Rust MeshCore node stack over the
+│                             KISS Modem serial protocol: packets,
+│                             routing, paths, contacts, acks. Every
+│                             cryptographic operation is delegated to
+│                             the device. Emits the same frame
+│                             vocabulary as meshcore-companion, so
+│                             bbs-mesh consumes either backend
+│                             through one event loop. Standalone.
 ├── docs/                   ← what you're reading
 └── config.example.toml     ← every knob documented; minimal
                               real-world configs much smaller

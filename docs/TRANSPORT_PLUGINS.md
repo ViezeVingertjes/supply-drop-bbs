@@ -150,6 +150,19 @@ UI are all active at the same time.
 are compiled in and started at startup (see ADR-0004). The planned path to
 runtime-loadable plugins is WASM, but that is post-1.0.
 
+**A new way to reach the same protocol is a backend, not a transport.**
+`bbs-mesh` reaches a MeshCore mesh four ways — TCP, Pi HAT, USB serial to
+companion firmware, and USB serial to KISS Modem firmware — but it is one
+plugin with one `Plugin::name()` of `"meshcore"`, one identity table, and one
+event loop. The backends sit behind a `RadioLink` enum in
+`crates/bbs-mesh/src/link.rs`; each produces the same `ClientEvent` stream and
+accepts the same `OutboundFrame` commands, so `transport.rs` cannot tell them
+apart. Registering a second `Plugin` would instead give the same mesh two
+identities and two identity-mapping tables, which
+[ADR-0011](adr/0011-transport-protocol-agnostic-core.md) Rule 2 exists to
+prevent. Reach for a new plugin when the *protocol* differs; reach for a
+backend when only the transport medium or the firmware on the far end does.
+
 **One instance per protocol is enforced by the config structure.** Each
 built-in protocol has a single named TOML section (`[plugins.mesh]`,
 `[plugins.meshtastic]`) — not an array — so the parser itself prevents

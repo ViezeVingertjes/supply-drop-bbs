@@ -27,12 +27,15 @@ Supply Drop BBS is the BBS half of a mesh-radio operator's stack. It speaks
 to:
 
 - **Mesh radios**, via a pluggable transport architecture. v1 supports
-  [MeshCore](https://meshcore.dev) (through
+  [MeshCore](https://meshcore.dev) three ways: a USB device running
+  companion firmware, a USB device running KISS Modem firmware, and a
+  Pi HAT through
   [`pymc_core`](https://github.com/meshcore-dev/pymc_core)'s
-  CompanionFrameServer running as a separate radio-bridge process).
-  Other LoRa mesh protocols - [Meshtastic](https://meshtastic.org)
-  most notably - are explicitly on the roadmap as sibling transport
-  plugins. The BBS-core itself is protocol-agnostic; see
+  CompanionFrameServer as a separate radio-bridge process. Only the
+  HAT path needs Python. Other LoRa mesh protocols -
+  [Meshtastic](https://meshtastic.org) most notably - are explicitly
+  on the roadmap as sibling transport plugins. The BBS-core itself is
+  protocol-agnostic; see
   [ADR-0011](docs/adr/0011-transport-protocol-agnostic-core.md).
 - **CLI clients** over a Unix-domain socket, for local administration and
   scripting.

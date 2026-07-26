@@ -111,6 +111,18 @@ not come.
   `KeyExchange` at 14.6 ms is cached per contact and `VerifySignature` at
   85.4 ms runs only for inbound adverts.
 
+- **The contact table is a JSON file, not a database table.** Companion
+  firmware keeps contacts in the radio's flash; a KISS modem does not, so
+  without somewhere to put them the BBS forgets every node's route on restart.
+  [ADR-0012](0012-persistence-layer.md) puts persistence in SQLite behind
+  `bbs-core`, but `meshcore-kiss` carries no `bbs-` dependency by design and so
+  cannot reach it. The table is written to `<data_dir>/meshcore-contacts.json`,
+  atomically and coalesced to at most one write per thirty seconds. It is
+  cache, not record: losing it costs a re-advert per node, not correctness, and
+  cached shared secrets are deliberately never written. If a future backend
+  needs durable per-contact state that actually matters, that is the point to
+  revisit the split rather than grow this file.
+
 ### Neutral
 
 - Companion and HAT operators see no change.
@@ -130,7 +142,26 @@ not come.
   answer to the second.
 - Radio parameters are validated before they reach the device. A frequency
   outside the SX126x tuning range is refused, because writing one leaves the
-  node deaf and silent until corrected by hand.
+  node deaf and silent until corrected by hand. The bounds live in
+  `meshcore_kiss::radio` and `bbs-mesh` defers to them, so a companion node and
+  a KISS node cannot come to disagree about what a usable frequency is.
+- **`path_length` is a packed byte, not a byte count.** It holds the hop count
+  in bits 0-5 and the hash width minus one in bits 6-7, in the packet header
+  and in a returned-path payload alike. The two readings coincide on a mesh
+  using one-byte hashes, which is the firmware default, and diverge on the two-
+  and three-byte hashes this BBS configures — so the mistake is invisible until
+  it is in the field. Everything that touches one goes through
+  `packet::path_byte_len`, and `Contact::out_path_len` stores the packed byte,
+  which is what both the firmware and `meshcore-companion` mean by that field.
+- **A route is learned in one place: a returned-path payload.** The path
+  accumulated on an inbound flooded packet runs sender-to-us — repeaters append
+  at the tail, direct routing consumes from the head — so it is the sender's
+  route to us, not ours to them. It is handed back to them unchanged and
+  nothing is learned from it, matching the firmware, which assigns `out_path`
+  only in `onContactPathRecv`. The BBS learns its own route from the reciprocal
+  return the far node sends after receiving ours. Both halves are needed:
+  without the reciprocal, neither side ever learns a route and every reply
+  floods for the life of the link.
 - Hardware tests sit behind a `hardware-tests` Cargo feature and read the port
   from `SDBBS_KISS_PORT`. They must run with `--test-threads=1`, since only one
   process can hold the serial port.

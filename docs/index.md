@@ -22,7 +22,7 @@ hero:
 features:
   - icon: 📻
     title: MeshCore and Meshtastic
-    details: Ships with bridges for MeshCore and Meshtastic LoRa networks. Tested on RAK WisBlock and Heltec hardware over serial and USB.
+    details: Ships with bridges for MeshCore and Meshtastic LoRa networks. Talks to MeshCore companion firmware, KISS Modem firmware, or a Pi HAT. Tested on RAK WisBlock and Heltec hardware over serial and USB.
   - icon: 🔀
     title: Run multiple transports at once
     details: MeshCore radio, the CLI socket, the web admin, and any custom transport all run in the same process and share one user database and message store. APRS, Telnet, IRC, Matrix are all possible.

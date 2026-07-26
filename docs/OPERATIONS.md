@@ -51,8 +51,8 @@ nothing else ([ADR-0013](adr/0013-native-serial-transport-for-usb-devices.md)).
 
 ## Architecture at a glance
 
-Supply Drop BBS supports two deployment topologies depending on your radio
-hardware.
+Supply Drop BBS supports three deployment topologies depending on your radio
+hardware and the firmware it runs.
 
 ### USB device (single-process)
 
@@ -72,6 +72,34 @@ hardware.
 
 The BBS speaks the companion-frame protocol directly over the serial port.
 No bridge process, no Python. One service to manage.
+
+### KISS Modem device (single-process)
+
+```
+   ┌──────────────────────────────────────────────────┐
+   │  supply-drop-bbs  (Rust - one process)           │
+   │                                                  │
+   │   bbs-core ── bbs-mesh ── meshcore-kiss          │
+   │                                 │                │
+   │                           serial (USB)           │
+   └─────────────────────────────────┼────────────────┘
+                                     │
+                              USB KISS Modem device
+                              radio + CSMA + all crypto
+```
+
+A device running MeshCore's **KISS Modem** firmware is a raw radio: it sends
+and receives whole LoRa packets but does no routing and keeps no contacts. The
+BBS runs the MeshCore node stack itself and asks the device to perform every
+cryptographic operation, so no key material is handled on the host and no
+Python is involved. Set `connection_type = "kiss"` and `serial_port`.
+
+> **The node identity cannot be backed up.** It lives in the device's flash and
+> the KISS firmware exposes no way to read or replace it, so `node export-key`
+> and `node import-key` refuse. Reflashing the device gives the BBS a new mesh
+> identity, and users will see it as a new node. If you need a portable
+> identity, run companion firmware instead. See
+> [ADR-0014](adr/0014-native-meshcore-stack-for-kiss-modems.md).
 
 ### Pi HAT (two-process)
 
@@ -227,8 +255,8 @@ sudo bash install.sh
 
 ### What the setup wizard asks
 
-1. **Radio connection type** - USB serial or Pi HAT
-2. **Serial port** *(USB only)* - detected automatically; you confirm or enter manually
+1. **Radio connection type** - USB serial, Pi HAT, TCP, or KISS Modem
+2. **Serial port** *(USB and KISS only)* - detected automatically; you confirm or enter manually
 3. **BBS name** - displayed to users on connect
 4. **Data directory** - defaults to `/var/lib/supply-drop-bbs`
 5. **Web admin UI** - whether to enable it, and if so, the password and bind address
@@ -779,6 +807,15 @@ to tell the failure modes apart:
 |---------|-----------------------|--------------|
 | BBS replies, user never sees them | `sends_total` climbs, `confirm_rate ≈ 0`, `failed_no_route ≈ 0` | **Outbound return-path loss.** The device accepts every send but no end-to-end ACK returns — a lossy multi-hop reverse path. Replies are not retried by default (`reply_max_attempts = 1`). |
 | BBS "ignores" repeated commands | `dedup_dropped_timestamp` rises against `inbound_received` for that node | **Inbound dedup.** The dedup keys on the timestamp the *sender* stamped. Senders bridged through pyMC are re-stamped whole-second `int(time.time())` at send time, so two identical sends from such a sender in the same second collide and the second is dropped. Senders on real firmware carry their app's stamp, which is normally distinct per send. Confirm with a `DEBUG` log line `dropping retransmitted message (timestamp dedup)`. |
+| Nobody on the mesh hears the BBS at all *(KISS only)* | `inbound_received` stays at zero and no adverts arrive | **Flood scope mismatch.** On a mesh that scopes its traffic, repeaters drop any flooded packet whose transport code they cannot reproduce. Set `flood_scope` in `[plugins.mesh.kiss]` to the same region name the rest of the mesh uses, or unset it if the mesh is unscoped. The derived key is logged at startup: `kiss: flood scope active`. |
+
+On a KISS Modem node, every reply floods until the far node returns a path.
+That is expected on first contact: the BBS answers a flooded message with a
+returned path, the far node replies with a reciprocal one, and both sides then
+route directly. A node that never sends a returned path — because it is out of
+range of the reverse route, or its firmware predates the feature — stays on
+flood routing, which works but costs more airtime. `PathUpdated` in the logs at
+`DEBUG` marks each route learned.
 
 For a live trace, raise the log level to `DEBUG` (Settings page or `[logging]
 level = "DEBUG"`) and watch for `mesh: inbound message received` and

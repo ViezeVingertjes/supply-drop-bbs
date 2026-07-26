@@ -349,6 +349,11 @@ transmit under the same scope to be heard at all. The key is `SHA256("#<name>")`
 truncated to sixteen bytes, so `flood_scope = "nl"` and `flood_scope = "#nl"`
 are the same scope. Leave it unset on an unscoped mesh.
 
+The name must carry no whitespace or control characters — the whole mesh has to
+derive the same key from it, and a stray character produces one nobody else
+derives, leaving the BBS silently unheard. The derived key is logged on connect
+as `kiss: flood scope active`, so it can be compared against another node's.
+
 ```toml
 [plugins.mesh]
 connection_type = "kiss"
