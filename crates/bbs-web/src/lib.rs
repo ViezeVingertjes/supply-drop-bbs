@@ -2294,6 +2294,31 @@ fn doc_remove_kiss_field(doc: &mut toml_edit::DocumentMut, key: &str) {
     }
 }
 
+/// Longest flood scope name accepted, generous against any region name in use.
+const MAX_FLOOD_SCOPE_LEN: usize = 63;
+
+/// Reject a flood scope name that could not identify a region.
+///
+/// The name is hashed to a transport key every node on the mesh must agree on,
+/// so a name that looks right but carries a stray control character produces a
+/// key nobody else derives and the BBS goes unheard. Better to refuse it here
+/// than to have an operator debug silence.
+fn check_flood_scope(name: &str) -> Result<(), &'static str> {
+    if name == "#" {
+        return Err("flood_scope needs a region name after the '#'");
+    }
+    if name.chars().count() > MAX_FLOOD_SCOPE_LEN {
+        return Err("flood_scope is too long");
+    }
+    if name.chars().any(char::is_control) {
+        return Err("flood_scope must not contain control characters");
+    }
+    if name.chars().any(char::is_whitespace) {
+        return Err("flood_scope must not contain whitespace");
+    }
+    Ok(())
+}
+
 /// Read a string key from `[plugins.mesh.kiss]`.
 fn toml_kiss_string(val: &toml::Value, key: &str) -> Option<String> {
     val.get("plugins")?
@@ -2837,6 +2862,9 @@ async fn api_patch_radio_config(
         if v.is_null() {
             doc_remove_kiss_field(&mut doc, "flood_scope");
         } else if let Some(name) = v.as_str().map(str::trim).filter(|n| !n.is_empty()) {
+            if let Err(e) = check_flood_scope(name) {
+                return (StatusCode::BAD_REQUEST, Json(json_error(e))).into_response();
+            }
             doc_set_kiss_field(&mut doc, "flood_scope", toml_edit::Value::from(name));
         } else {
             doc_remove_kiss_field(&mut doc, "flood_scope");
@@ -4163,5 +4191,31 @@ mod config_doc_tests {
         let parsed: toml::Value =
             toml::from_str("[plugins.mesh]\nenabled = true\n").expect("valid toml");
         assert_eq!(toml_kiss_string(&parsed, "flood_scope"), None);
+    }
+}
+
+#[cfg(test)]
+mod flood_scope_tests {
+    use super::check_flood_scope;
+
+    #[test]
+    fn ordinary_region_names_are_accepted() {
+        for name in ["nl", "#nl", "be", "uk-south", "region_1"] {
+            assert!(check_flood_scope(name).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_bare_hash_names_no_region() {
+        assert!(check_flood_scope("#").is_err());
+    }
+
+    #[test]
+    fn names_that_would_derive_a_key_nobody_shares_are_refused() {
+        assert!(check_flood_scope("nl\n").is_err(), "control character");
+        assert!(check_flood_scope("nl\u{7f}").is_err(), "delete");
+        assert!(check_flood_scope("north holland").is_err(), "whitespace");
+        assert!(check_flood_scope(&"n".repeat(64)).is_err(), "too long");
+        assert!(check_flood_scope(&"n".repeat(63)).is_ok(), "at the limit");
     }
 }
