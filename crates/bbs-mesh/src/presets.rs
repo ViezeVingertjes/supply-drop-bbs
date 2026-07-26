@@ -278,32 +278,18 @@ pub fn resolve_radio(
 /// corrects it by hand. The commonest way to get there is a frequency typed in
 /// megahertz: `869.618` becomes `869`, which the radio accepts as 869 Hz.
 ///
-/// The bounds are the SX126x tuning range and the LoRa parameter ranges
-/// MeshCore itself uses, so anything outside them could not have worked.
+/// The bounds live in `meshcore_kiss::radio`, which applies the same check to
+/// anything written over the KISS backend. They describe the transceiver rather
+/// than either protocol, so keeping one table means a companion node and a KISS
+/// node cannot come to disagree about what a usable frequency is.
 fn check_in_range(radio: &ResolvedRadio) -> Result<(), String> {
-    if !(137_000_000..=1_020_000_000).contains(&radio.frequency_hz) {
-        return Err(format!(
-            "frequency_hz {} is outside 137000000-1020000000; the value is in hertz, \
-             so 869.618 MHz is 869618000",
-            radio.frequency_hz
-        ));
-    }
-    if !(7_800..=500_000).contains(&radio.bandwidth_hz) {
-        return Err(format!(
-            "bandwidth_hz {} is outside 7800-500000",
-            radio.bandwidth_hz
-        ));
-    }
-    if !(5..=12).contains(&radio.spreading_factor) {
-        return Err(format!(
-            "spreading_factor {} is outside 5-12",
-            radio.spreading_factor
-        ));
-    }
-    if !(5..=8).contains(&radio.coding_rate) {
-        return Err(format!("coding_rate {} is outside 5-8", radio.coding_rate));
-    }
-    Ok(())
+    meshcore_kiss::radio::validate_radio_params(&meshcore_kiss::hw::frame::RadioParams {
+        frequency_hz: radio.frequency_hz,
+        bandwidth_hz: radio.bandwidth_hz,
+        spreading_factor: radio.spreading_factor,
+        coding_rate: radio.coding_rate,
+    })
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
