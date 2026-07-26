@@ -1,7 +1,7 @@
 //! Contact store tests: upsert, replay rejection, lookup, paths and secrets.
 
-use meshcore_kiss::node::contacts::{ContactStore, DEFAULT_CONTACT_CAPACITY};
-use meshcore_kiss::packet::AdvertBody;
+use meshcore_kiss::node::contacts::{ContactStore, DEFAULT_CONTACT_CAPACITY, OUT_PATH_UNKNOWN};
+use meshcore_kiss::packet::{pack_path_length, AdvertBody};
 
 fn advert(pubkey: [u8; 32], timestamp: u32, name: &str) -> AdvertBody {
     AdvertBody {
@@ -91,7 +91,8 @@ fn new_contact_starts_with_an_unknown_path_and_the_advert_node_type() {
     let key = [0xA1; 32];
     store.upsert_from_advert(&advert(key, 1, "node"));
     let contact = store.by_pubkey(&key).expect("present");
-    assert_eq!(contact.out_path_len, -1);
+    assert_eq!(contact.out_path_len, OUT_PATH_UNKNOWN);
+    assert!(store.route(&key).is_none());
     assert_eq!(contact.adv_type, 0x01);
     assert_eq!(contact.flags, 0);
     assert_eq!(contact.gps_lat, 0);
@@ -104,36 +105,76 @@ fn set_path_then_reset_path_clears_the_route() {
     let key = [0xA1; 32];
     store.upsert_from_advert(&advert(key, 1, "node"));
 
-    store.set_path(&key, &[0x11, 0x22, 0x33]);
+    let one_three_byte_hop = pack_path_length(3, 1);
+    assert!(store.set_path(&key, one_three_byte_hop, &[0x11, 0x22, 0x33]));
     let contact = store.by_pubkey(&key).expect("present");
-    assert_eq!(contact.out_path_len, 3);
+    assert_eq!(contact.out_path_len, one_three_byte_hop as i8);
     assert_eq!(&contact.out_path[..3], &[0x11, 0x22, 0x33]);
+    assert_eq!(
+        store.route(&key),
+        Some((one_three_byte_hop, vec![0x11, 0x22, 0x33]))
+    );
 
     assert!(store.reset_path(&key));
     let contact = store.by_pubkey(&key).expect("present");
-    assert_eq!(contact.out_path_len, -1);
+    assert_eq!(contact.out_path_len, OUT_PATH_UNKNOWN);
+    assert!(store.route(&key).is_none());
 }
 
+/// `out_path_len` is the packed `path_length`, so three-byte hashes push it
+/// past `i8::MAX` and it lands negative. Only [`OUT_PATH_UNKNOWN`] may be read
+/// as "no route"; a `< 0` test here would flood every reply on a mesh using
+/// hashes wider than a byte.
 #[test]
-fn set_path_rejects_an_oversized_path_without_panicking() {
+fn a_negative_out_path_len_that_is_not_the_sentinel_is_still_a_route() {
     let mut store = ContactStore::default();
     let key = [0xA1; 32];
     store.upsert_from_advert(&advert(key, 1, "node"));
-    store.set_path(&key, &[0x11, 0x22]);
 
-    assert!(!store.set_path(&key, &[0x33; 65]));
+    let three_hops = pack_path_length(3, 3);
+    assert!(
+        three_hops as i8 <= 0,
+        "expected the packed byte to go negative"
+    );
+    assert!(store.set_path(&key, three_hops, &[0x11; 9]));
+
+    assert_eq!(store.route(&key), Some((three_hops, vec![0x11; 9])));
+}
+
+#[test]
+fn set_path_rejects_encodings_that_do_not_match_the_path() {
+    let mut store = ContactStore::default();
+    let key = [0xA1; 32];
+    store.upsert_from_advert(&advert(key, 1, "node"));
+
+    let two_one_byte_hops = pack_path_length(1, 2);
+    assert!(store.set_path(&key, two_one_byte_hops, &[0x11, 0x22]));
+
+    assert!(
+        !store.set_path(&key, pack_path_length(3, 2), &[0x33, 0x44]),
+        "two three-byte hops need six bytes, not two"
+    );
+    assert!(
+        !store.set_path(&key, 0xFF, &[0x33; 63]),
+        "the reserved four-byte hash size must be refused"
+    );
+    assert!(
+        !store.set_path(&key, pack_path_length(3, 63), &[0x33; 189]),
+        "a path over MAX_PATH_SIZE must be refused"
+    );
+
     let contact = store.by_pubkey(&key).expect("present");
-    assert_eq!(contact.out_path_len, 2);
+    assert_eq!(contact.out_path_len, two_one_byte_hops as i8);
     assert_eq!(&contact.out_path[..2], &[0x11, 0x22]);
 
-    assert!(store.set_path(&key, &[0x44; 64]));
-    assert_eq!(store.by_pubkey(&key).expect("present").out_path_len, 64);
+    assert!(store.set_path(&key, pack_path_length(1, 64 - 1), &[0x44; 63]));
 }
 
 #[test]
 fn set_path_on_unknown_contact_reports_false() {
     let mut store = ContactStore::default();
-    assert!(!store.set_path(&[0xFF; 32], &[0x11]));
+    assert!(!store.set_path(&[0xFF; 32], pack_path_length(1, 1), &[0x11]));
+    assert!(store.route(&[0xFF; 32]).is_none());
 }
 
 #[test]
@@ -180,7 +221,7 @@ fn modified_since_and_most_recent_lastmod_track_changes() {
     assert_eq!(store.modified_since(lastmod).len(), 1);
     assert!(store.modified_since(lastmod + 1).is_empty());
 
-    store.set_path(&key, &[0x11]);
+    store.set_path(&key, pack_path_length(1, 1), &[0x11]);
     assert!(store.by_pubkey(&key).expect("present").lastmod >= lastmod);
     assert!(store.most_recent_lastmod() >= lastmod);
 }
@@ -204,7 +245,8 @@ fn contacts_survive_a_save_and_load_round_trip() {
     let mut store = ContactStore::default();
     store.upsert_from_advert(&advert_named(key(1), 1_700_000_000, "Alice"));
     store.upsert_from_advert(&advert_named(key(2), 1_700_000_100, "Bob"));
-    assert!(store.set_path(&key(1), &[0x11, 0x22, 0x33]));
+    let one_three_byte_hop = pack_path_length(3, 1);
+    assert!(store.set_path(&key(1), one_three_byte_hop, &[0x11, 0x22, 0x33]));
     store.save(&path).expect("saves");
 
     let loaded = ContactStore::load(&path, DEFAULT_CONTACT_CAPACITY);
@@ -214,9 +256,49 @@ fn contacts_survive_a_save_and_load_round_trip() {
     assert_eq!(alice.name, "Alice");
     assert_eq!(alice.adv_type, 0x03);
     assert_eq!(alice.last_advert_timestamp, 1_700_000_000);
-    assert_eq!(alice.out_path_len, 3);
+    assert_eq!(alice.out_path_len, one_three_byte_hop as i8);
     assert_eq!(&alice.out_path[..3], &[0x11, 0x22, 0x33]);
+    assert_eq!(
+        loaded.route(&key(1)),
+        Some((one_three_byte_hop, vec![0x11, 0x22, 0x33])),
+        "the hash width a route was learned at must survive a restart"
+    );
     assert_eq!(loaded.by_pubkey(&key(2)).expect("bob present").name, "Bob");
+}
+
+#[test]
+fn a_contact_file_from_an_older_format_is_discarded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("contacts.json");
+    std::fs::write(
+        &path,
+        br#"{"version":1,"contacts":[{"pubkey":"a1","adv_type":1,"flags":0,
+            "out_path":"112233","name":"Alice","last_advert_timestamp":1,
+            "gps_lat":0,"gps_lon":0,"lastmod":1}]}"#,
+    )
+    .expect("writes");
+
+    assert!(ContactStore::load(&path, DEFAULT_CONTACT_CAPACITY).is_empty());
+}
+
+#[test]
+fn a_contact_whose_stored_path_contradicts_its_length_is_dropped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("contacts.json");
+
+    let mut store = ContactStore::default();
+    store.upsert_from_advert(&advert_named(key(1), 1, "Alice"));
+    store.save(&path).expect("saves");
+
+    let raw = std::fs::read_to_string(&path).expect("reads");
+    let corrupted = raw.replace(
+        "\"out_path_len\": -1",
+        &format!("\"out_path_len\": {}", pack_path_length(3, 2) as i8),
+    );
+    assert_ne!(raw, corrupted, "the fixture must actually change");
+    std::fs::write(&path, corrupted).expect("writes");
+
+    assert!(ContactStore::load(&path, DEFAULT_CONTACT_CAPACITY).is_empty());
 }
 
 #[test]
@@ -229,7 +311,11 @@ fn an_unknown_path_round_trips_as_unknown() {
     store.save(&path).expect("saves");
 
     let loaded = ContactStore::load(&path, DEFAULT_CONTACT_CAPACITY);
-    assert_eq!(loaded.by_pubkey(&key(1)).expect("present").out_path_len, -1);
+    assert_eq!(
+        loaded.by_pubkey(&key(1)).expect("present").out_path_len,
+        OUT_PATH_UNKNOWN
+    );
+    assert!(loaded.route(&key(1)).is_none());
 }
 
 #[test]
@@ -361,7 +447,7 @@ fn the_store_reports_when_it_needs_saving() {
     store.save(&path).expect("saves");
     assert!(!store.is_dirty(), "saving must clear the dirty flag");
 
-    store.set_path(&key(1), &[0x01, 0x02, 0x03]);
+    store.set_path(&key(1), pack_path_length(3, 1), &[0x01, 0x02, 0x03]);
     assert!(store.is_dirty(), "a path change must mark the store dirty");
 }
 

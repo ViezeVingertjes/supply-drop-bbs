@@ -13,6 +13,25 @@
 //! key, so collisions between contacts are ordinary. An inbound encrypted
 //! payload is attributed by trying each candidate contact's shared secret and
 //! treating [`HwError::MacFailed`] as "not this one".
+//!
+//! # Path learning
+//!
+//! A route is learned from exactly one place: a returned-path payload. That
+//! mirrors the firmware, which assigns `out_path` only in `onContactPathRecv`
+//! (`MeshCore/src/helpers/BaseChatMesh.cpp:331`).
+//!
+//! The path accumulated on an inbound flooded packet is **not** a route back to
+//! its sender. Repeaters append their hash at the tail as it travels
+//! (`MeshCore/src/Mesh.cpp:349`) and direct routing consumes from the head
+//! (`MeshCore/src/Mesh.cpp:88`), so that path runs sender-to-us and would have
+//! to be reversed hop by hop to run the other way. Rather than reverse it, this
+//! node does what the firmware does: hand it back to the sender as *their*
+//! route to us, and wait to be told ours.
+//!
+//! Being told is the reciprocal half. A node that receives a flooded returned
+//! path answers with one of its own, sent directly along the route it has just
+//! learned (`MeshCore/src/Mesh.cpp:174-178`). Without that answer neither side
+//! ever learns a route and every reply floods for the life of the link.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -29,8 +48,8 @@ use crate::node::ack::{ack_hash_input, expected_ack_from_digest, inbound_ack_has
 use crate::node::contacts::ContactStore;
 use crate::node::scope::FloodScope;
 use crate::packet::{
-    AdvertBody, EncryptedBody, Packet, PathBody, PayloadType, RouteType, TxtMsgPlain,
-    MAX_PACKET_PAYLOAD,
+    pack_path_length, AdvertBody, EncryptedBody, Packet, PathBody, PayloadType, RouteType,
+    TxtMsgPlain, MAX_PACKET_PAYLOAD,
 };
 
 /// Node type advertised for the BBS: a room server.
@@ -51,6 +70,22 @@ const PENDING_ACK_TTL: Duration = Duration::from_secs(300);
 
 /// How many random bytes are fetched from the modem at a time.
 const RANDOM_BATCH: u8 = 32;
+
+/// Payload type written for a returned path that bundles nothing.
+///
+/// The firmware writes `0xFF` here (`MeshCore/src/Mesh.cpp:478`) and masks it
+/// to its low nibble on the way back in, so a reader sees `0x0F`. That is
+/// [`PayloadType::RawCustom`], which nothing bundles, so it never collides with
+/// the [`PayloadType::Ack`] this crate looks for — but it is a real payload
+/// type, so a future reader must match on the type it wants rather than
+/// treating anything non-`Ack` as absent.
+const PATH_RETURN_DUMMY_TYPE: u8 = 0xFF;
+
+/// Longest path plus bundled extra a returned path may carry.
+///
+/// `MAX_PACKET_PAYLOAD` less the two address hashes and one cipher block,
+/// matching `MAX_COMBINED_PATH` at `MeshCore/src/Mesh.cpp:440`.
+const MAX_COMBINED_PATH: usize = MAX_PACKET_PAYLOAD - 2 - 16;
 
 /// Settings the node needs that do not come from the device.
 #[derive(Debug, Clone)]
@@ -239,24 +274,27 @@ impl NodeState {
         }
     }
 
+    /// The `path_length` a packet we originate with no route carries.
+    ///
+    /// Zero hops at the hash width this node is configured for, which is what
+    /// repeaters extend as the packet floods.
+    fn empty_path_length(&self) -> u8 {
+        pack_path_length(self.config.path_hash_size, 0)
+    }
+
     async fn finish_packet<S>(
         &self,
         link: &mut HwLink<S>,
         route: RouteType,
         payload_type: PayloadType,
+        path_length: u8,
         path: &[u8],
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, KissError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        let mut packet = Packet::build(
-            route,
-            payload_type,
-            self.config.path_hash_size,
-            path,
-            payload,
-        );
+        let mut packet = Packet::build(route, payload_type, path_length, path, payload);
 
         if let Some(scope) = self.scope {
             let code = scope
@@ -319,8 +357,15 @@ impl NodeState {
         } else {
             RouteType::Direct
         };
-        self.finish_packet(link, route, PayloadType::Advert, &[], advert.encode())
-            .await
+        self.finish_packet(
+            link,
+            route,
+            PayloadType::Advert,
+            self.empty_path_length(),
+            &[],
+            advert.encode(),
+        )
+        .await
     }
 
     /// Send a text message to the contact identified by a six-byte key prefix.
@@ -352,8 +397,7 @@ impl NodeState {
             })));
         };
         let pubkey = contact.pubkey;
-        let out_path_len = contact.out_path_len;
-        let out_path = contact.out_path;
+        let route = self.contacts.route(&pubkey);
 
         let plain = TxtMsgPlain {
             timestamp,
@@ -399,15 +443,20 @@ impl NodeState {
             })));
         }
 
-        let is_flood = out_path_len < 0;
-        let (route, path) = if is_flood {
-            (RouteType::Flood, Vec::new())
-        } else {
-            let len = usize::try_from(out_path_len).unwrap_or(0);
-            (RouteType::Direct, out_path[..len].to_vec())
+        let is_flood = route.is_none();
+        let (route_type, path_length, path) = match route {
+            Some((path_length, path)) => (RouteType::Direct, path_length, path),
+            None => (RouteType::Flood, self.empty_path_length(), Vec::new()),
         };
         let raw = self
-            .finish_packet(link, route, PayloadType::TxtMsg, &path, payload)
+            .finish_packet(
+                link,
+                route_type,
+                PayloadType::TxtMsg,
+                path_length,
+                &path,
+                payload,
+            )
             .await?;
 
         let digest = self
@@ -513,15 +562,6 @@ impl NodeState {
         let is_new = self.contacts.upsert_from_advert(&advert);
         let mut output = NodeOutput::default();
 
-        if packet.route_type().is_flood()
-            && !packet.path.is_empty()
-            && self.contacts.set_path(&advert.pubkey, &packet.path)
-        {
-            output.frames.push(InboundFrame::PathUpdated {
-                pubkey: advert.pubkey,
-            });
-        }
-
         match self.contacts.by_pubkey(&advert.pubkey) {
             Some(contact) if is_new => output
                 .frames
@@ -590,7 +630,7 @@ impl NodeState {
                     self.accept_text(link, packet, &pubkey, &plaintext, snr_db)
                         .await
                 }
-                PayloadType::Path => Ok(self.accept_path(&pubkey, &plaintext)),
+                PayloadType::Path => self.accept_path(link, packet, &pubkey, &plaintext).await,
                 other => {
                     debug!(?other, "kiss: decrypted an unsupported payload type");
                     Ok(NodeOutput::default())
@@ -626,15 +666,6 @@ impl NodeState {
 
         let mut output = NodeOutput::default();
 
-        if packet.route_type().is_flood()
-            && !packet.path.is_empty()
-            && self.contacts.set_path(pubkey, &packet.path)
-        {
-            output
-                .frames
-                .push(InboundFrame::PathUpdated { pubkey: *pubkey });
-        }
-
         let mut prefix = [0u8; 6];
         prefix.copy_from_slice(&pubkey[..6]);
         let message = ContactMsg {
@@ -656,26 +687,33 @@ impl NodeState {
         let random_byte = self.random_byte(link).await?;
         let ack_hash = inbound_ack_hash(&digest, plain.extended_attempt, random_byte);
 
-        let contact_path = self
-            .contacts
-            .by_pubkey(pubkey)
-            .map(|contact| (contact.out_path_len, contact.out_path));
-
         let raw = if packet.route_type().is_flood() {
             let secret = self.shared_secret(link, pubkey).await?;
-            self.build_path_return(link, pubkey, secret, &packet.path, &ack_hash)
-                .await?
+            self.build_path_return(
+                link,
+                pubkey,
+                secret,
+                packet.path_length,
+                &packet.path,
+                Some((PayloadType::Ack as u8, ack_hash.to_vec())),
+                None,
+            )
+            .await?
         } else {
-            let (len, path) = contact_path.unwrap_or((-1, [0u8; 64]));
-            let (route, path) = if len < 0 {
-                (RouteType::Flood, Vec::new())
-            } else {
-                let len = usize::try_from(len).unwrap_or(0);
-                (RouteType::Direct, path[..len].to_vec())
+            let (route_type, path_length, path) = match self.contacts.route(pubkey) {
+                Some((path_length, path)) => (RouteType::Direct, path_length, path),
+                None => (RouteType::Flood, self.empty_path_length(), Vec::new()),
             };
             Some(
-                self.finish_packet(link, route, PayloadType::Ack, &path, ack_hash.to_vec())
-                    .await?,
+                self.finish_packet(
+                    link,
+                    route_type,
+                    PayloadType::Ack,
+                    path_length,
+                    &path,
+                    ack_hash.to_vec(),
+                )
+                .await?,
             )
         };
 
@@ -685,21 +723,61 @@ impl NodeState {
         Ok(output)
     }
 
+    /// Build a returned-path packet telling `pubkey` how to reach us.
+    ///
+    /// `path_length` and `path` are the route as it accumulated on the packet
+    /// that arrived from `pubkey`, handed back unchanged: repeaters append
+    /// their hash at the tail (`MeshCore/src/Mesh.cpp:349`) and direct routing
+    /// consumes from the head (`MeshCore/src/Mesh.cpp:88`), so accumulation
+    /// order is already the order the peer must transmit in. Reversing it here
+    /// would send their replies back the way they came.
+    ///
+    /// `extra` bundles a payload so it rides along instead of costing a second
+    /// transmission. Passing `None` appends the dummy type byte and random
+    /// blob the firmware uses to keep the packet hash unique
+    /// (`MeshCore/src/Mesh.cpp:477-479`).
+    ///
+    /// `send_along` decides how the returned path itself travels: `None` floods
+    /// it, `Some` routes it directly along the given route. The two callers
+    /// differ deliberately, following the firmware. Answering a flooded message
+    /// floods the return (`BaseChatMesh.cpp:250-252`), because a peer that
+    /// flooded us has no route here and any route we hold to them may be stale.
+    /// Answering a flooded *returned path* sends the reciprocal directly along
+    /// the route it just carried (`Mesh.cpp:176-177`), which is known good: a
+    /// packet arrived over it.
+    #[allow(clippy::too_many_arguments)]
     async fn build_path_return<S>(
         &mut self,
         link: &mut HwLink<S>,
         pubkey: &[u8; 32],
         secret: [u8; 32],
+        path_length: u8,
         path: &[u8],
-        ack_hash: &[u8; 6],
+        extra: Option<(u8, Vec<u8>)>,
+        send_along: Option<(u8, Vec<u8>)>,
     ) -> Result<Option<Vec<u8>>, KissError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
+        let (extra_type, extra) = match extra {
+            Some((kind, bytes)) => (kind, bytes),
+            None => (PATH_RETURN_DUMMY_TYPE, self.random_bytes(link, 4).await?),
+        };
+
+        if path.len() + extra.len() + 5 > MAX_COMBINED_PATH {
+            debug!(
+                path = path.len(),
+                extra = extra.len(),
+                "kiss: path return would not fit in one packet"
+            );
+            return Ok(None);
+        }
+
         let plaintext = PathBody {
+            path_length,
             path: path.to_vec(),
-            extra_type: Some(PayloadType::Ack as u8),
-            extra: ack_hash.to_vec(),
+            extra_type: Some(extra_type),
+            extra,
         }
         .encode();
 
@@ -723,29 +801,44 @@ impl NodeState {
             mac,
             ciphertext,
         };
+
+        let (route_type, out_length, out_path) = match send_along {
+            Some((length, path)) => (RouteType::Direct, length, path),
+            None => (RouteType::Flood, self.empty_path_length(), Vec::new()),
+        };
         Ok(Some(
             self.finish_packet(
                 link,
-                RouteType::Flood,
+                route_type,
                 PayloadType::Path,
-                &[],
+                out_length,
+                &out_path,
                 body.encode(),
             )
             .await?,
         ))
     }
 
-    fn accept_path(&mut self, pubkey: &[u8; 32], plaintext: &[u8]) -> NodeOutput {
+    async fn accept_path<S>(
+        &mut self,
+        link: &mut HwLink<S>,
+        packet: &Packet,
+        pubkey: &[u8; 32],
+        plaintext: &[u8],
+    ) -> Result<NodeOutput, KissError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
         let body = match PathBody::parse(plaintext) {
             Ok(body) => body,
             Err(error) => {
                 debug!(%error, "kiss: dropping a malformed path return");
-                return NodeOutput::default();
+                return Ok(NodeOutput::default());
             }
         };
 
         let mut output = NodeOutput::default();
-        if self.contacts.set_path(pubkey, &body.path) {
+        if self.contacts.set_path(pubkey, body.path_length, &body.path) {
             output
                 .frames
                 .push(InboundFrame::PathUpdated { pubkey: *pubkey });
@@ -756,7 +849,26 @@ impl NodeState {
             output.frames.extend(bundled.frames);
         }
 
-        output
+        if packet.route_type().is_flood() {
+            let secret = self.shared_secret(link, pubkey).await?;
+            let learned = self.contacts.route(pubkey);
+            if let Some(raw) = self
+                .build_path_return(
+                    link,
+                    pubkey,
+                    secret,
+                    packet.path_length,
+                    &packet.path,
+                    None,
+                    learned,
+                )
+                .await?
+            {
+                output.transmit.push(raw);
+            }
+        }
+
+        Ok(output)
     }
 
     fn handle_ack_payload(&mut self, payload: &[u8]) -> NodeOutput {
@@ -859,6 +971,21 @@ impl NodeState {
                 Ok(0)
             }
         }
+    }
+
+    async fn random_bytes<S>(
+        &mut self,
+        link: &mut HwLink<S>,
+        len: usize,
+    ) -> Result<Vec<u8>, KissError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            out.push(self.random_byte(link).await?);
+        }
+        Ok(out)
     }
 
     async fn airtime_ms<S>(&self, link: &mut HwLink<S>, packet_len: usize) -> Result<u32, KissError>

@@ -39,6 +39,54 @@ pub const ADV_FLAG_HAS_FEATURE1: u8 = 0x20;
 /// Advert appdata flag: a second reserved two-byte feature field is present.
 pub const ADV_FLAG_HAS_FEATURE2: u8 = 0x40;
 
+/// The path-hash-size code the protocol reserves and no packet may carry.
+const RESERVED_HASH_SIZE_CODE: u8 = 0b11;
+
+/// Pack a hash width and a hop count into a `path_length` byte.
+///
+/// `hash_size` is clamped to 1 to 3 and `hop_count` to the six bits the field
+/// holds, so the result never names the reserved four-byte width. It can still
+/// describe a path longer than [`MAX_PATH_SIZE`] — 63 three-byte hops is 189
+/// bytes — which [`path_byte_len`] rejects. Check the result there before
+/// trusting it against a buffer.
+#[must_use]
+pub fn pack_path_length(hash_size: u8, hop_count: u8) -> u8 {
+    ((hash_size.clamp(1, 3) - 1) << 6) | (hop_count & 0x3F)
+}
+
+/// The width in bytes of each hash a `path_length` byte declares.
+#[must_use]
+pub fn path_hash_size(path_length: u8) -> u8 {
+    (path_length >> 6) + 1
+}
+
+/// The number of hops a `path_length` byte declares.
+#[must_use]
+pub fn path_hash_count(path_length: u8) -> u8 {
+    path_length & 0x3F
+}
+
+/// How many bytes of path a `path_length` byte describes.
+///
+/// `path_length` is not a byte count: it packs the hop count into bits 0-5 and
+/// the hash width minus one into bits 6-7, so the path occupies
+/// `hop_count * hash_size` bytes (`MeshCore/src/Packet.h:79-81`). Reading it as
+/// a length is the single easiest way to talk past the firmware, so every
+/// caller goes through this function.
+///
+/// Returns `None` for the reserved four-byte hash size and for a path longer
+/// than [`MAX_PATH_SIZE`], matching `Packet::isValidPathLen`
+/// (`MeshCore/src/Packet.cpp:13-18`).
+#[must_use]
+pub fn path_byte_len(path_length: u8) -> Option<usize> {
+    if path_length >> 6 == RESERVED_HASH_SIZE_CODE {
+        return None;
+    }
+    let bytes =
+        usize::from(path_hash_count(path_length)) * usize::from(path_hash_size(path_length));
+    (bytes <= MAX_PATH_SIZE).then_some(bytes)
+}
+
 /// Advert appdata flag: the remainder of the appdata is the node name.
 pub const ADV_FLAG_HAS_NAME: u8 = 0x80;
 
@@ -210,17 +258,12 @@ impl Packet {
             .get(cursor)
             .ok_or_else(|| KissError::malformed("packet has no path_length byte"))?;
         cursor += 1;
-        if path_length >> 6 == 0b11 {
-            return Err(KissError::malformed(
-                "path_length uses the reserved 4-byte hash size",
-            ));
-        }
-        let path_bytes = usize::from(path_length & 0x3F) * (usize::from(path_length >> 6) + 1);
-        if path_bytes > MAX_PATH_SIZE {
-            return Err(KissError::malformed(format!(
-                "path is {path_bytes} bytes, over the {MAX_PATH_SIZE}-byte limit"
-            )));
-        }
+        let path_bytes = path_byte_len(path_length).ok_or_else(|| {
+            KissError::malformed(format!(
+                "path_length {path_length:#04x} is not a valid encoding: either the reserved \
+                 4-byte hash size or a path over the {MAX_PATH_SIZE}-byte limit"
+            ))
+        })?;
         let path = raw
             .get(cursor..cursor + path_bytes)
             .ok_or_else(|| KissError::malformed("packet truncated in path"))?
@@ -291,13 +334,13 @@ impl Packet {
     /// The width in bytes of each hash in [`Packet::path`].
     #[must_use]
     pub fn path_hash_size(&self) -> u8 {
-        (self.path_length >> 6) + 1
+        path_hash_size(self.path_length)
     }
 
     /// The number of hashes in [`Packet::path`].
     #[must_use]
     pub fn path_hash_count(&self) -> u8 {
-        self.path_length & 0x3F
+        path_hash_count(self.path_length)
     }
 }
 
@@ -633,22 +676,29 @@ fn trim_trailing_nuls(bytes: &[u8]) -> &[u8] {
 }
 
 impl Packet {
-    /// Assemble a packet from its parts, computing `path_length` from the path.
+    /// Assemble a packet from its parts.
     ///
-    /// `path_hash_size` must be 1, 2 or 3; anything else is clamped into range.
-    /// The path is truncated to a whole number of hashes and to
-    /// [`MAX_PATH_SIZE`].
+    /// `path_length` is the packed byte described by [`path_byte_len`], not a
+    /// byte count. Build one with [`pack_path_length`], or pass through the
+    /// value a learned route was stored with.
+    ///
+    /// The hop count is reduced to whatever whole hashes `path` actually
+    /// supplies, and the stored `path_length` is rewritten to match, so the
+    /// result always survives a [`Packet::encode`] and [`Packet::decode`]
+    /// round trip.
     #[must_use]
     pub fn build(
         route: RouteType,
         payload_type: PayloadType,
-        path_hash_size: u8,
+        path_length: u8,
         path: &[u8],
         payload: Vec<u8>,
     ) -> Self {
-        let hash_size = path_hash_size.clamp(1, 3);
-        let usable = path.len().min(MAX_PATH_SIZE);
-        let hop_count = (usable / usize::from(hash_size)).min(0x3F);
+        let hash_size = path_hash_size(path_length).clamp(1, 3);
+        let supplied = path.len().min(MAX_PATH_SIZE) / usize::from(hash_size);
+        let hop_count = usize::from(path_hash_count(path_length))
+            .min(supplied)
+            .min(0x3F);
         let path_bytes = hop_count * usize::from(hash_size);
         let header = ((payload_type as u8) << 2) | (route as u8);
         let transport_codes = if route.has_transport_codes() {
@@ -660,7 +710,7 @@ impl Packet {
         Self {
             header,
             transport_codes,
-            path_length: ((hash_size - 1) << 6) | u8::try_from(hop_count).unwrap_or(0),
+            path_length: pack_path_length(hash_size, u8::try_from(hop_count).unwrap_or(0)),
             path: path[..path_bytes].to_vec(),
             payload,
         }
@@ -669,12 +719,19 @@ impl Packet {
 
 /// A returned-path payload, carried inside the encrypted envelope.
 ///
-/// The sender learns the route back to us from `path`, and `extra` optionally
-/// bundles another payload so an acknowledgement rides along instead of
-/// costing a second transmission.
+/// The recipient learns the route back to the sender from `path`, and `extra`
+/// optionally bundles another payload so an acknowledgement rides along
+/// instead of costing a second transmission.
+///
+/// The leading byte is the packed `path_length`, exactly as the firmware
+/// writes it (`MeshCore/src/Mesh.cpp:469`) and reads it back
+/// (`MeshCore/src/Mesh.cpp:162-169`). It is **not** a byte count: reading it as
+/// one drops every path return from a mesh using hashes wider than a byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathBody {
-    /// Path hashes, one hop per entry group.
+    /// Packed hop count and hash width for [`PathBody::path`].
+    pub path_length: u8,
+    /// Path hashes, `path_byte_len(path_length)` bytes of them.
     pub path: Vec<u8>,
     /// Payload type of the bundled extra, when present.
     pub extra_type: Option<u8>,
@@ -685,28 +742,37 @@ pub struct PathBody {
 impl PathBody {
     /// Parse a returned-path plaintext.
     ///
+    /// The extra's type byte is masked to its low nibble, matching the
+    /// firmware's `data[k++] & 0x0F` (`MeshCore/src/Mesh.cpp:170`), which
+    /// reserves the high nibble.
+    ///
     /// # Errors
     ///
-    /// Returns [`KissError::Malformed`] when the declared path length runs past
-    /// the end of the plaintext.
+    /// Returns [`KissError::Malformed`] when the plaintext is empty, when the
+    /// leading `path_length` is not a valid encoding, or when the path it
+    /// declares runs past the end of the plaintext.
     pub fn parse(plaintext: &[u8]) -> Result<Self, KissError> {
-        let path_len = usize::from(
-            *plaintext
-                .first()
-                .ok_or_else(|| KissError::malformed("path payload has no length byte"))?,
-        );
+        let path_length = *plaintext
+            .first()
+            .ok_or_else(|| KissError::malformed("path payload has no path_length byte"))?;
+        let byte_len = path_byte_len(path_length).ok_or_else(|| {
+            KissError::malformed(format!(
+                "path payload declares an invalid path_length {path_length:#04x}"
+            ))
+        })?;
         let path = plaintext
-            .get(1..1 + path_len)
+            .get(1..1 + byte_len)
             .ok_or_else(|| KissError::malformed("path payload truncated in path"))?
             .to_vec();
 
-        let rest = &plaintext[1 + path_len..];
+        let rest = &plaintext[1 + byte_len..];
         let (extra_type, extra) = match rest.split_first() {
-            Some((kind, tail)) => (Some(*kind), trim_trailing_nuls(tail).to_vec()),
+            Some((kind, tail)) => (Some(kind & 0x0F), trim_trailing_nuls(tail).to_vec()),
             None => (None, Vec::new()),
         };
 
         Ok(Self {
+            path_length,
             path,
             extra_type,
             extra,
@@ -717,7 +783,7 @@ impl PathBody {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(2 + self.path.len() + self.extra.len());
-        out.push(u8::try_from(self.path.len()).unwrap_or(0));
+        out.push(self.path_length);
         out.extend_from_slice(&self.path);
         if let Some(kind) = self.extra_type {
             out.push(kind);

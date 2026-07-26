@@ -9,6 +9,20 @@
 //! a six-byte key prefix, while a path or an acknowledgement carries a single
 //! byte. A one-byte hash collides often enough that [`ContactStore::by_hash`]
 //! returns every candidate for the caller to try in turn.
+//!
+//! # What `out_path_len` holds
+//!
+//! [`Contact::out_path_len`] is the packed `path_length` byte, not a byte
+//! count: hop count in bits 0-5, hash width minus one in bits 6-7. That is what
+//! the firmware stores (`MeshCore/src/helpers/BaseChatMesh.cpp:331` keeps
+//! whatever `Packet::copyPath` was handed, and `Mesh::sendDirect` writes it
+//! straight back into the packet header), and it is what `meshcore-companion`
+//! decodes off the wire, so a contact means the same thing whichever backend
+//! produced it. [`OUT_PATH_UNKNOWN`] marks a contact with no route yet.
+//!
+//! The two coincide on a mesh using one-byte hashes, which is the firmware
+//! default and why the distinction is easy to miss; they diverge the moment a
+//! mesh moves to the two- or three-byte hashes this BBS configures.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,7 +34,7 @@ use tracing::{debug, warn};
 use meshcore_companion::constants::MAX_PATH_SIZE;
 use meshcore_companion::types::Contact;
 
-use crate::packet::AdvertBody;
+use crate::packet::{path_byte_len, AdvertBody};
 
 /// How many contacts a store keeps before evicting the stalest.
 ///
@@ -28,8 +42,19 @@ use crate::packet::AdvertBody;
 /// megabytes: comfortable on a Raspberry Pi and far above any realistic mesh.
 pub const DEFAULT_CONTACT_CAPACITY: usize = 10_000;
 
+/// The `out_path_len` of a contact whose route is not known.
+///
+/// This is the wire byte `0xFF` read as `i8`, matching `OUT_PATH_UNKNOWN` in
+/// `MeshCore/src/helpers/ContactInfo.h:6`. No valid packed `path_length` can
+/// collide with it: `0xFF` names the reserved four-byte hash size.
+pub const OUT_PATH_UNKNOWN: i8 = -1;
+
 /// Format version written into the contact file.
-const PERSIST_VERSION: u32 = 1;
+///
+/// Version 1 wrote `out_path_len` as a byte count. A version-1 file is
+/// discarded rather than migrated, because a byte count cannot say which hash
+/// width its hops were recorded at; the cost is one re-advert per contact.
+const PERSIST_VERSION: u32 = 2;
 
 /// The on-disk form of the contact table.
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,11 +66,15 @@ struct PersistedContacts {
 /// One contact as written to disk.
 ///
 /// Shared secrets are absent by design; they are re-derived on demand.
+///
+/// `out_path_len` is written as the packed `path_length` byte the contact
+/// stores, so the hash width a route was learned at survives a restart.
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedContact {
     pubkey: String,
     adv_type: u8,
     flags: u8,
+    out_path_len: i8,
     out_path: String,
     name: String,
     last_advert_timestamp: u32,
@@ -56,16 +85,13 @@ struct PersistedContact {
 
 impl From<&Contact> for PersistedContact {
     fn from(contact: &Contact) -> Self {
-        let path_len = usize::try_from(contact.out_path_len.max(0)).unwrap_or(0);
+        let bytes = stored_path_byte_len(contact.out_path_len).unwrap_or(0);
         Self {
             pubkey: to_hex(&contact.pubkey),
             adv_type: contact.adv_type,
             flags: contact.flags,
-            out_path: if contact.out_path_len < 0 {
-                String::new()
-            } else {
-                to_hex(&contact.out_path[..path_len])
-            },
+            out_path_len: contact.out_path_len,
+            out_path: to_hex(&contact.out_path[..bytes]),
             name: contact.name.clone(),
             last_advert_timestamp: contact.last_advert_timestamp,
             gps_lat: contact.gps_lat,
@@ -79,17 +105,14 @@ impl PersistedContact {
     fn into_contact(self) -> Option<Contact> {
         let pubkey: [u8; 32] = from_hex(&self.pubkey)?.try_into().ok()?;
         let path = from_hex(&self.out_path)?;
-        if path.len() > MAX_PATH_SIZE {
-            return None;
-        }
+
+        let out_path_len = match stored_path_byte_len(self.out_path_len) {
+            Some(bytes) if bytes == path.len() => self.out_path_len,
+            _ => return None,
+        };
 
         let mut out_path = [0u8; MAX_PATH_SIZE];
         out_path[..path.len()].copy_from_slice(&path);
-        let out_path_len = if self.out_path.is_empty() {
-            -1
-        } else {
-            i8::try_from(path.len()).ok()?
-        };
 
         Some(Contact {
             pubkey,
@@ -104,6 +127,18 @@ impl PersistedContact {
             lastmod: self.lastmod,
         })
     }
+}
+
+/// How many bytes of `out_path` a stored `out_path_len` describes.
+///
+/// Returns `Some(0)` for [`OUT_PATH_UNKNOWN`], since a contact with no route
+/// carries no path bytes, and `None` when the value is not a valid packed
+/// `path_length`.
+fn stored_path_byte_len(out_path_len: i8) -> Option<usize> {
+    if out_path_len == OUT_PATH_UNKNOWN {
+        return Some(0);
+    }
+    path_byte_len(out_path_len as u8)
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -160,9 +195,10 @@ impl ContactStore {
 
     /// Read a store back from disk.
     ///
-    /// A missing or unreadable file yields an empty store, because losing the
-    /// contact table costs a re-advert rather than correctness. When the file
-    /// holds more contacts than `capacity`, the freshest are kept.
+    /// A missing, unreadable or older-format file yields an empty store,
+    /// because losing the contact table costs a re-advert rather than
+    /// correctness. When the file holds more contacts than `capacity`, the
+    /// freshest are kept.
     #[must_use]
     pub fn load(path: &Path, capacity: usize) -> Self {
         let mut store = Self::with_capacity(capacity);
@@ -187,6 +223,16 @@ impl ContactStore {
                 return store;
             }
         };
+
+        if persisted.version != PERSIST_VERSION {
+            warn!(
+                found = persisted.version,
+                expected = PERSIST_VERSION,
+                path = %path.display(),
+                "kiss: contact store is an older format, starting empty"
+            );
+            return store;
+        }
 
         let mut contacts: Vec<Contact> = persisted
             .contacts
@@ -271,9 +317,8 @@ impl ContactStore {
     /// `last_advert_timestamp` is a replay and is discarded without touching
     /// the entry, matching the check in `BaseChatMesh::onAdvertRecv`.
     ///
-    /// A new contact starts with `out_path_len` at `-1`, meaning the path is
-    /// unknown and the first message sent to it floods, and with `flags` at
-    /// zero.
+    /// A new contact starts at [`OUT_PATH_UNKNOWN`], so the first message sent
+    /// to it floods, and with `flags` at zero.
     pub fn upsert_from_advert(&mut self, advert: &AdvertBody) -> bool {
         let now = Self::now();
         let name = advert.name.clone().unwrap_or_default();
@@ -305,7 +350,7 @@ impl ContactStore {
             pubkey: advert.pubkey,
             adv_type,
             flags: 0,
-            out_path_len: -1,
+            out_path_len: OUT_PATH_UNKNOWN,
             out_path: [0u8; MAX_PATH_SIZE],
             name,
             last_advert_timestamp: advert.timestamp,
@@ -362,18 +407,16 @@ impl ContactStore {
         removed
     }
 
-    /// Record the outbound path to a contact.
+    /// Record the outbound route to a contact.
     ///
-    /// Returns `false`, leaving the contact untouched, when the contact is
-    /// unknown or the path is longer than the `MAX_PATH_SIZE` bytes a MeshCore
-    /// packet header holds.
-    pub fn set_path(&mut self, pubkey: &[u8; 32], path: &[u8]) -> bool {
-        if path.len() > MAX_PATH_SIZE {
+    /// `path_length` is the packed byte, and `path` must be exactly the bytes
+    /// it describes. Returns `false`, leaving the contact untouched, when the
+    /// contact is unknown, when `path_length` is not a valid encoding, or when
+    /// the two disagree.
+    pub fn set_path(&mut self, pubkey: &[u8; 32], path_length: u8, path: &[u8]) -> bool {
+        if path_byte_len(path_length) != Some(path.len()) {
             return false;
         }
-        let Ok(path_len) = i8::try_from(path.len()) else {
-            return false;
-        };
         let now = Self::now();
         let Some(contact) = self
             .contacts
@@ -384,10 +427,27 @@ impl ContactStore {
         };
         contact.out_path = [0u8; MAX_PATH_SIZE];
         contact.out_path[..path.len()].copy_from_slice(path);
-        contact.out_path_len = path_len;
+        contact.out_path_len = path_length as i8;
         contact.lastmod = now;
         self.dirty = true;
         true
+    }
+
+    /// The outbound route to a contact: its packed `path_length` and bytes.
+    ///
+    /// Returns `None` when the contact is unknown or has no route yet, which
+    /// is the caller's signal to flood instead.
+    #[must_use]
+    pub fn route(&self, pubkey: &[u8; 32]) -> Option<(u8, Vec<u8>)> {
+        let contact = self.by_pubkey(pubkey)?;
+        if contact.out_path_len == OUT_PATH_UNKNOWN {
+            return None;
+        }
+        let bytes = stored_path_byte_len(contact.out_path_len)?;
+        Some((
+            contact.out_path_len as u8,
+            contact.out_path[..bytes].to_vec(),
+        ))
     }
 
     /// Forget the outbound path to a contact so the next message floods.
@@ -403,7 +463,7 @@ impl ContactStore {
             return false;
         };
         contact.out_path = [0u8; MAX_PATH_SIZE];
-        contact.out_path_len = -1;
+        contact.out_path_len = OUT_PATH_UNKNOWN;
         contact.lastmod = now;
         self.dirty = true;
         true

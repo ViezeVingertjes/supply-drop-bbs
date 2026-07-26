@@ -65,6 +65,14 @@ impl Default for Behaviour {
 pub struct Recorded {
     pub transmitted: Vec<Vec<u8>>,
     pub requests: Vec<Vec<u8>>,
+    /// Feeds the fake random generator.
+    ///
+    /// A real modem returns different bytes every time, and the protocol leans
+    /// on that: the random tail of an acknowledgement and the blob on a
+    /// bundle-less path return exist so two otherwise identical packets hash
+    /// differently. A constant here would let a node that reused its "random"
+    /// bytes pass every test.
+    pub random_counter: u8,
 }
 
 #[derive(Clone)]
@@ -230,6 +238,18 @@ fn handle_frame(
         return Vec::new();
     }
 
+    if data[0] == SUB_GET_RANDOM {
+        let len = usize::from(data.get(1).copied().unwrap_or(1));
+        let mut recorded = recorded.lock().expect("recorded mutex");
+        let bytes: Vec<u8> = (0..len)
+            .map(|_| {
+                recorded.random_counter = recorded.random_counter.wrapping_add(1);
+                recorded.random_counter
+            })
+            .collect();
+        return vec![encode(CMD_SET_HARDWARE, &reply(0x82, &bytes))];
+    }
+
     vec![encode(CMD_SET_HARDWARE, &respond(&state, data))]
 }
 
@@ -239,10 +259,7 @@ fn respond(state: &Behaviour, data: &[u8]) -> Vec<u8> {
     match sub {
         SUB_PING => vec![0x97],
         SUB_GET_IDENTITY => reply(0x81, &RECORDED_IDENTITY),
-        SUB_GET_RANDOM => {
-            let len = usize::from(body.first().copied().unwrap_or(1));
-            reply(0x82, &vec![0x5A; len])
-        }
+        // SUB_GET_RANDOM is answered in `handle_frame`, which owns the counter.
         SUB_VERIFY_SIGNATURE => vec![0x83, u8::from(state.signature_valid)],
         SUB_SIGN_DATA => reply(0x84, &[0x11; 64]),
         SUB_ENCRYPT_DATA if body.len() > 32 => {

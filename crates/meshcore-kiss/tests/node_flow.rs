@@ -9,7 +9,8 @@ use meshcore_kiss::hw::client::HwLink;
 use meshcore_kiss::node::scope::FloodScope;
 use meshcore_kiss::node::state::{NodeConfig, NodeOutput, NodeState};
 use meshcore_kiss::packet::{
-    AdvertBody, EncryptedBody, Packet, PathBody, PayloadType, RouteType, TxtMsgPlain,
+    pack_path_length, AdvertBody, EncryptedBody, Packet, PathBody, PayloadType, RouteType,
+    TxtMsgPlain,
 };
 use support::{fake_modem, FakeModem, RECORDED_IDENTITY};
 use tokio::io::DuplexStream;
@@ -40,12 +41,18 @@ fn fake_encrypt(plaintext: &[u8]) -> Vec<u8> {
     padded.iter().map(|byte| byte ^ XOR_MASK).collect()
 }
 
+/// The packed `path_length` for `path` read as three-byte hops, which is the
+/// width these tests configure the node for.
+fn three_byte_hops(path: &[u8]) -> u8 {
+    pack_path_length(3, u8::try_from(path.len() / 3).expect("a short path"))
+}
+
 fn advert_packet(pubkey: [u8; 32], timestamp: u32, name: &str, path: &[u8]) -> Vec<u8> {
     let advert = AdvertBody::unsigned(pubkey, timestamp, 0x01, None, Some(name));
     Packet::build(
         RouteType::Flood,
         PayloadType::Advert,
-        3,
+        three_byte_hops(path),
         path,
         advert.encode(),
     )
@@ -66,7 +73,14 @@ fn encrypted_packet(
         mac: [0x5B, 0x6A],
         ciphertext: fake_encrypt(plaintext),
     };
-    Packet::build(route, payload_type, 3, path, body.encode()).encode()
+    Packet::build(
+        route,
+        payload_type,
+        three_byte_hops(path),
+        path,
+        body.encode(),
+    )
+    .encode()
 }
 
 fn text_packet(route: RouteType, path: &[u8], text: &str, timestamp: u32) -> Vec<u8> {
@@ -171,8 +185,13 @@ async fn our_own_advert_echoed_back_is_ignored() {
     assert!(node.contacts().by_pubkey(&RECORDED_IDENTITY).is_none());
 }
 
+/// The path on an inbound flooded packet runs sender-to-us: repeaters append at
+/// the tail and direct routing consumes from the head. Storing it as our route
+/// to the sender would send every reply back the way it came, so the firmware
+/// does not learn from it and neither do we — a route arrives only in a
+/// returned-path payload.
 #[tokio::test]
-async fn a_flooded_advert_stores_the_accumulated_path_verbatim() {
+async fn a_flooded_advert_teaches_us_no_route_back() {
     let (mut link, _modem, mut node) = node();
     let path = [0x0A, 0x0B, 0x0C, 0x1A, 0x1B, 0x1C];
 
@@ -181,13 +200,17 @@ async fn a_flooded_advert_stores_the_accumulated_path_verbatim() {
         .await
         .expect("handles the packet");
 
-    assert!(output
-        .frames
-        .iter()
-        .any(|frame| matches!(frame, InboundFrame::PathUpdated { pubkey } if *pubkey == PEER)));
-    let contact = node.contacts().by_pubkey(&PEER).expect("stored");
-    assert_eq!(contact.out_path_len, 6);
-    assert_eq!(&contact.out_path[..6], &path);
+    assert!(
+        !output
+            .frames
+            .iter()
+            .any(|frame| matches!(frame, InboundFrame::PathUpdated { .. })),
+        "an advert must not announce a path it did not learn"
+    );
+    assert!(
+        node.contacts().route(&PEER).is_none(),
+        "the accumulated path is the peer's route to us, not ours to them"
+    );
 }
 
 #[tokio::test]
@@ -262,10 +285,182 @@ async fn a_flooded_message_is_answered_with_a_path_return_carrying_the_ack() {
 
     let body = EncryptedBody::parse(&reply.payload).expect("parses");
     let plaintext = fake_encrypt(&body.ciphertext);
+
+    assert_eq!(
+        plaintext[0],
+        pack_path_length(3, 1),
+        "the leading byte is the packed path_length, not a byte count"
+    );
+    assert_eq!(&plaintext[1..4], &[0x01, 0x02, 0x03]);
+    assert_eq!(plaintext[4], PayloadType::Ack as u8);
+
     let path_body = PathBody::parse(&plaintext).expect("parses");
+    assert_eq!(path_body.path_length, pack_path_length(3, 1));
     assert_eq!(path_body.path, vec![0x01, 0x02, 0x03]);
     assert_eq!(path_body.extra_type, Some(PayloadType::Ack as u8));
     assert_eq!(path_body.extra.len(), 6);
+}
+
+/// The path a returned-path payload carries is our route to the sender, so it
+/// is learned verbatim. `handle_encrypted` reaches this through the same
+/// decrypt-by-candidate loop a text message takes.
+#[tokio::test]
+async fn a_returned_path_teaches_us_the_route_and_earns_a_reciprocal() {
+    let (mut link, _modem, mut node) = node();
+    register_peer(&mut link, &mut node).await;
+
+    let returned = PathBody {
+        path_length: pack_path_length(3, 2),
+        path: vec![0xA1, 0xA2, 0xA3, 0xB1, 0xB2, 0xB3],
+        extra_type: None,
+        extra: Vec::new(),
+    };
+    let inbound_path = [0xC1, 0xC2, 0xC3];
+    let raw = encrypted_packet(
+        PayloadType::Path,
+        RouteType::Flood,
+        PEER,
+        RECORDED_IDENTITY,
+        &returned.encode(),
+        &inbound_path,
+    );
+
+    let output = node
+        .handle_inbound_packet(&mut link, &raw, None)
+        .await
+        .expect("handles the packet");
+
+    assert!(output
+        .frames
+        .iter()
+        .any(|frame| matches!(frame, InboundFrame::PathUpdated { pubkey } if *pubkey == PEER)));
+    assert_eq!(
+        node.contacts().route(&PEER),
+        Some((
+            pack_path_length(3, 2),
+            vec![0xA1, 0xA2, 0xA3, 0xB1, 0xB2, 0xB3]
+        ))
+    );
+
+    assert_eq!(
+        output.transmit.len(),
+        1,
+        "a flooded returned path must be answered with a reciprocal one"
+    );
+    let reciprocal = Packet::decode(&output.transmit[0]).expect("decodes");
+    assert_eq!(reciprocal.payload_type(), PayloadType::Path);
+    assert_eq!(
+        reciprocal.route_type(),
+        RouteType::Direct,
+        "the reciprocal goes out along the route we just learned"
+    );
+    assert_eq!(reciprocal.path, vec![0xA1, 0xA2, 0xA3, 0xB1, 0xB2, 0xB3]);
+
+    let body = EncryptedBody::parse(&reciprocal.payload).expect("parses");
+    let plaintext = fake_encrypt(&body.ciphertext);
+    let echoed = PathBody::parse(&plaintext).expect("parses");
+    assert_eq!(echoed.path, inbound_path.to_vec());
+    assert_eq!(
+        echoed.extra.len(),
+        4,
+        "a bundle-less return carries the firmware's random blob"
+    );
+}
+
+/// The blob on a bundle-less path return exists to keep the packet hash
+/// unique, so two returns built back to back must not come out identical —
+/// a repeater's duplicate table would swallow the second.
+#[tokio::test]
+async fn successive_path_returns_do_not_repeat_their_random_blob() {
+    let (mut link, _modem, mut node) = node();
+    register_peer(&mut link, &mut node).await;
+
+    // The two inbound packets must differ in their *payload*: dedup keys on
+    // payload type and payload alone, so varying only the accumulated path
+    // would see the second dropped as a repeat.
+    let mut blobs = Vec::new();
+    for hop in [0xA3u8, 0xA4] {
+        let returned = PathBody {
+            path_length: pack_path_length(3, 1),
+            path: vec![0xA1, 0xA2, hop],
+            extra_type: None,
+            extra: Vec::new(),
+        };
+        let raw = encrypted_packet(
+            PayloadType::Path,
+            RouteType::Flood,
+            PEER,
+            RECORDED_IDENTITY,
+            &returned.encode(),
+            &[0xC1, 0xC2, 0xC3],
+        );
+        let output = node
+            .handle_inbound_packet(&mut link, &raw, None)
+            .await
+            .expect("handles the packet");
+
+        let reciprocal = Packet::decode(&output.transmit[0]).expect("decodes");
+        let body = EncryptedBody::parse(&reciprocal.payload).expect("parses");
+        let echoed = PathBody::parse(&fake_encrypt(&body.ciphertext)).expect("parses");
+        blobs.push(echoed.extra);
+    }
+
+    assert_ne!(blobs[0], blobs[1]);
+}
+
+/// Answering a flooded message floods the returned path even when a route to
+/// the sender is on file. A peer that flooded us has no route here, and the one
+/// we hold to them may be stale — the firmware floods here for the same reason
+/// (`BaseChatMesh.cpp:250-252`), and only the reciprocal goes out directly.
+#[tokio::test]
+async fn a_path_return_floods_even_when_a_route_is_known() {
+    let (mut link, _modem, mut node) = node();
+    register_peer(&mut link, &mut node).await;
+    assert!(node
+        .contacts_mut()
+        .set_path(&PEER, pack_path_length(3, 1), &[0x07, 0x08, 0x09]));
+
+    let raw = text_packet(RouteType::Flood, &[0x01, 0x02, 0x03], "hi", 42);
+    let output = node
+        .handle_inbound_packet(&mut link, &raw, None)
+        .await
+        .expect("handles the packet");
+
+    let reply = Packet::decode(&output.transmit[0]).expect("decodes");
+    assert_eq!(reply.payload_type(), PayloadType::Path);
+    assert_eq!(reply.route_type(), RouteType::Flood);
+    assert!(reply.path.is_empty());
+}
+
+/// A returned path that arrived directly needs no reciprocal: the sender
+/// already knows the way here, which is how the packet got here.
+#[tokio::test]
+async fn a_direct_returned_path_is_not_answered() {
+    let (mut link, _modem, mut node) = node();
+    register_peer(&mut link, &mut node).await;
+
+    let returned = PathBody {
+        path_length: pack_path_length(3, 1),
+        path: vec![0xA1, 0xA2, 0xA3],
+        extra_type: None,
+        extra: Vec::new(),
+    };
+    let raw = encrypted_packet(
+        PayloadType::Path,
+        RouteType::Direct,
+        PEER,
+        RECORDED_IDENTITY,
+        &returned.encode(),
+        &[],
+    );
+
+    let output = node
+        .handle_inbound_packet(&mut link, &raw, None)
+        .await
+        .expect("handles the packet");
+
+    assert!(node.contacts().route(&PEER).is_some());
+    assert!(output.transmit.is_empty());
 }
 
 #[tokio::test]
@@ -359,7 +554,9 @@ async fn sending_without_a_known_path_floods() {
 async fn sending_with_a_known_path_uses_direct_routing() {
     let (mut link, _modem, mut node) = node();
     register_peer(&mut link, &mut node).await;
-    assert!(node.contacts_mut().set_path(&PEER, &[0x07, 0x08, 0x09]));
+    assert!(node
+        .contacts_mut()
+        .set_path(&PEER, pack_path_length(3, 1), &[0x07, 0x08, 0x09]));
 
     let mut prefix = [0u8; 6];
     prefix.copy_from_slice(&PEER[..6]);
@@ -393,7 +590,7 @@ async fn a_matching_acknowledgement_confirms_the_send() {
     let ack = Packet::build(
         RouteType::Direct,
         PayloadType::Ack,
-        3,
+        three_byte_hops(&[]),
         &[],
         expected_ack.to_le_bytes().to_vec(),
     )
@@ -416,7 +613,7 @@ async fn an_acknowledgement_for_nothing_pending_is_ignored() {
     let ack = Packet::build(
         RouteType::Direct,
         PayloadType::Ack,
-        3,
+        three_byte_hops(&[]),
         &[],
         0xDEAD_BEEFu32.to_le_bytes().to_vec(),
     )
@@ -433,7 +630,9 @@ async fn an_acknowledgement_for_nothing_pending_is_ignored() {
 async fn reset_path_makes_the_next_send_flood_again() {
     let (mut link, _modem, mut node) = node();
     register_peer(&mut link, &mut node).await;
-    assert!(node.contacts_mut().set_path(&PEER, &[0x07, 0x08, 0x09]));
+    assert!(node
+        .contacts_mut()
+        .set_path(&PEER, pack_path_length(3, 1), &[0x07, 0x08, 0x09]));
     assert!(node.reset_path(&PEER));
 
     let mut prefix = [0u8; 6];
@@ -508,7 +707,9 @@ async fn a_scope_turns_flooded_packets_into_transport_flood() {
 async fn a_scope_turns_direct_packets_into_transport_direct() {
     let (mut link, _modem, mut node) = node();
     register_peer(&mut link, &mut node).await;
-    assert!(node.contacts_mut().set_path(&PEER, &[0x07, 0x08, 0x09]));
+    assert!(node
+        .contacts_mut()
+        .set_path(&PEER, pack_path_length(3, 1), &[0x07, 0x08, 0x09]));
     let scope = FloodScope::derive(&mut link, "nl")
         .await
         .expect("derives the key");
@@ -602,7 +803,7 @@ async fn a_two_byte_path_is_split_into_two_byte_hops() {
     register_peer(&mut link, &mut node).await;
     assert!(node
         .contacts_mut()
-        .set_path(&PEER, &[0x11, 0x22, 0x33, 0x44]));
+        .set_path(&PEER, pack_path_length(2, 2), &[0x11, 0x22, 0x33, 0x44]));
 
     let mut prefix = [0u8; 6];
     prefix.copy_from_slice(&PEER[..6]);

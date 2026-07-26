@@ -1,7 +1,8 @@
 #![allow(missing_docs)]
 
 use meshcore_kiss::packet::{
-    AdvertBody, EncryptedBody, Packet, PayloadType, RouteType, TxtMsgPlain,
+    pack_path_length, path_byte_len, path_hash_count, path_hash_size, AdvertBody, EncryptedBody,
+    Packet, PathBody, PayloadType, RouteType, TxtMsgPlain, MAX_PATH_SIZE,
 };
 use proptest::prelude::*;
 
@@ -317,4 +318,183 @@ fn extended_attempt_survives_an_encode_parse_roundtrip() {
     };
     let parsed = TxtMsgPlain::parse(&plain.encode()).expect("parses");
     assert_eq!(parsed, plain);
+}
+
+// ─── path_length, the packed byte ──────────────────────────────────
+//
+// `path_length` is not a byte count. These tests pin the encoding against
+// byte vectors shaped the way the firmware writes them, because a round trip
+// through this crate's own encoder agrees with itself whether or not it agrees
+// with MeshCore.
+
+#[test]
+fn path_length_packs_hash_width_above_hop_count() {
+    assert_eq!(pack_path_length(1, 0), 0x00);
+    assert_eq!(pack_path_length(1, 5), 0x05);
+    assert_eq!(pack_path_length(2, 5), 0x45);
+    assert_eq!(pack_path_length(3, 1), 0x81);
+    assert_eq!(pack_path_length(3, 63), 0xBF);
+}
+
+#[test]
+fn path_byte_len_multiplies_hops_by_hash_width() {
+    assert_eq!(path_byte_len(pack_path_length(1, 6)), Some(6));
+    assert_eq!(path_byte_len(pack_path_length(2, 3)), Some(6));
+    assert_eq!(path_byte_len(pack_path_length(3, 2)), Some(6));
+    assert_eq!(path_byte_len(0x00), Some(0));
+}
+
+#[test]
+fn path_byte_len_refuses_the_reserved_width_and_oversized_paths() {
+    assert_eq!(path_byte_len(0xC1), None, "reserved 4-byte hash size");
+    assert_eq!(path_byte_len(0xFF), None, "reserved width, 63 hops");
+    assert_eq!(
+        path_byte_len(pack_path_length(3, 63)),
+        None,
+        "63 three-byte hops is 189 bytes, over MAX_PATH_SIZE"
+    );
+    assert_eq!(path_byte_len(pack_path_length(1, 63)), Some(63));
+}
+
+#[test]
+fn pack_path_length_clamps_rather_than_wrapping() {
+    assert_eq!(pack_path_length(0, 1), pack_path_length(1, 1));
+    assert_eq!(pack_path_length(9, 1), pack_path_length(3, 1));
+    assert_eq!(path_hash_count(pack_path_length(1, 64)), 0);
+}
+
+#[test]
+fn build_reduces_the_hop_count_to_the_path_it_was_given() {
+    let packet = Packet::build(
+        RouteType::Direct,
+        PayloadType::Ack,
+        pack_path_length(3, 4),
+        &[0x11; 6],
+        vec![0xAA],
+    );
+    assert_eq!(packet.path_hash_size(), 3);
+    assert_eq!(packet.path_hash_count(), 2, "only two whole hops supplied");
+    assert_eq!(packet.path, vec![0x11; 6]);
+    assert_eq!(Packet::decode(&packet.encode()).expect("decodes"), packet);
+}
+
+#[test]
+fn build_keeps_a_learned_route_at_the_width_it_was_learned_at() {
+    let learned = pack_path_length(2, 3);
+    let packet = Packet::build(
+        RouteType::Direct,
+        PayloadType::TxtMsg,
+        learned,
+        &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+        vec![0xAA],
+    );
+    assert_eq!(packet.path_length, learned);
+    assert_eq!(packet.path_hash_size(), 2);
+    assert_eq!(packet.path_hash_count(), 3);
+}
+
+// ─── PathBody ──────────────────────────────────────────────────────
+
+/// Two three-byte hops as `Mesh::createPathReturn` lays them out: the packed
+/// `path_length`, the path bytes, the extra's type, then the extra.
+const FIRMWARE_PATH_RETURN: &[u8] = &[
+    0x82, // pack_path_length(3, 2)
+    0xA1, 0xA2, 0xA3, 0xB1, 0xB2, 0xB3, // two three-byte hops
+    0x03, // PAYLOAD_TYPE_ACK
+    0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x07, // six-byte ack hash
+];
+
+#[test]
+fn a_firmware_path_return_is_understood() {
+    let body = PathBody::parse(FIRMWARE_PATH_RETURN).expect("parses");
+    assert_eq!(body.path_length, pack_path_length(3, 2));
+    assert_eq!(body.path, vec![0xA1, 0xA2, 0xA3, 0xB1, 0xB2, 0xB3]);
+    assert_eq!(body.extra_type, Some(PayloadType::Ack as u8));
+    assert_eq!(body.extra, vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x07]);
+}
+
+#[test]
+fn a_path_return_encodes_the_way_the_firmware_reads_it() {
+    let body = PathBody {
+        path_length: pack_path_length(3, 2),
+        path: vec![0xA1, 0xA2, 0xA3, 0xB1, 0xB2, 0xB3],
+        extra_type: Some(PayloadType::Ack as u8),
+        extra: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x07],
+    };
+    assert_eq!(body.encode(), FIRMWARE_PATH_RETURN);
+}
+
+/// Six bytes of path written as the byte count `6` would be read by the
+/// firmware as six one-byte hops, so the repeaters along the route would match
+/// on one byte of a three-byte hash. Guards the defect directly.
+#[test]
+fn a_path_return_does_not_write_a_byte_count() {
+    let body = PathBody {
+        path_length: pack_path_length(3, 2),
+        path: vec![0xA1, 0xA2, 0xA3, 0xB1, 0xB2, 0xB3],
+        extra_type: None,
+        extra: Vec::new(),
+    };
+    assert_eq!(body.encode()[0], 0x82);
+    assert_ne!(body.encode()[0], 6);
+}
+
+#[test]
+fn a_path_return_with_no_bundled_extra_parses() {
+    let body = PathBody::parse(&[0x00]).expect("parses");
+    assert_eq!(body.path_length, 0);
+    assert!(body.path.is_empty());
+    assert_eq!(body.extra_type, None);
+    assert!(body.extra.is_empty());
+}
+
+/// The firmware writes `0xFF` as the dummy type for a return that bundles
+/// nothing and masks it to its low nibble on the way in
+/// (`MeshCore/src/Mesh.cpp:170`), so it can never be mistaken for an ACK.
+#[test]
+fn the_extra_type_is_masked_to_its_low_nibble() {
+    let mut raw = vec![0x00, 0xFF];
+    raw.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+    let body = PathBody::parse(&raw).expect("parses");
+    assert_eq!(body.extra_type, Some(0x0F));
+    assert_ne!(body.extra_type, Some(PayloadType::Ack as u8));
+}
+
+#[test]
+fn a_path_return_with_an_invalid_path_length_is_rejected() {
+    assert!(PathBody::parse(&[]).is_err(), "empty");
+    assert!(PathBody::parse(&[0xC1, 0x00]).is_err(), "reserved width");
+    assert!(
+        PathBody::parse(&[pack_path_length(3, 2), 0xA1, 0xA2]).is_err(),
+        "declares six path bytes but supplies two"
+    );
+}
+
+proptest! {
+    /// Anything `path_byte_len` accepts must survive the round trip, and the
+    /// leading byte must come back unchanged so the hash width is preserved.
+    #[test]
+    fn path_bodies_roundtrip(
+        hash_size in 1u8..=3,
+        hop_count in 0u8..=20,
+        extra in prop::collection::vec(any::<u8>(), 0..8),
+    ) {
+        let path_length = pack_path_length(hash_size, hop_count);
+        let byte_len = path_byte_len(path_length).expect("in range");
+        let body = PathBody {
+            path_length,
+            path: (0..byte_len).map(|i| (i as u8) | 0x80).collect(),
+            extra_type: Some(PayloadType::Ack as u8),
+            extra: extra.iter().map(|b| b | 1).collect(),
+        };
+
+        let encoded = body.encode();
+        prop_assert_eq!(encoded[0], path_length);
+        let parsed = PathBody::parse(&encoded).expect("parses");
+        prop_assert_eq!(parsed.path_length, path_length);
+        prop_assert_eq!(&parsed.path, &body.path);
+        prop_assert_eq!(path_hash_size(parsed.path_length), hash_size);
+        prop_assert_eq!(path_hash_count(parsed.path_length), hop_count);
+        prop_assert!(parsed.path.len() <= MAX_PATH_SIZE);
+    }
 }
