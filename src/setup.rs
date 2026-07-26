@@ -578,16 +578,16 @@ pub fn run_wizard(config_out: Option<&Path>) {
         section("MeshCore radio connection");
 
         let conn_items = &[
-            "USB / serial  (Heltec V3, T-Beam, RAK4631 — plug in via USB)",
+            "USB / serial  (Heltec V3, T-Beam, RAK4631 — companion firmware)",
             "Pi HAT        (ZebraHat, Waveshare, PiMesh, FemtoFox — SPI on GPIO)",
             "TCP           (connect to a running pymc_core, default port 5000)",
+            "KISS Modem    (USB device running MeshCore KISS Modem firmware)",
         ];
-        let conn_default = if ex.mesh_connection_type == "hat" {
-            1
-        } else if ex.mesh_connection_type == "tcp" {
-            2
-        } else {
-            0
+        let conn_default = match ex.mesh_connection_type.as_str() {
+            "hat" => 1,
+            "tcp" => 2,
+            "kiss" => 3,
+            _ => 0,
         };
         let conn_choice = prompt_select(
             &theme,
@@ -598,11 +598,31 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
         let (ct, sp, br, ma) = match conn_choice {
             0 => {
-                let (ct, sp, br) =
-                    configure_serial(&theme, ex.mesh_serial_port.as_deref(), ex.mesh_baud_rate);
+                let (ct, sp, br) = configure_serial(
+                    &theme,
+                    "serial",
+                    ex.mesh_serial_port.as_deref(),
+                    ex.mesh_baud_rate,
+                );
                 (ct, sp, br, None)
             }
             1 => ("hat", None, None, None),
+            3 => {
+                println!(
+                    "\nKISS Modem firmware is a raw radio: the BBS runs the MeshCore node\n\
+                     stack itself and asks the device to do the cryptography. No pymc_core\n\
+                     is needed.\n\n\
+                     Note the node identity lives in the device's flash and cannot be\n\
+                     exported or moved to another board.\n"
+                );
+                let (ct, sp, br) = configure_serial(
+                    &theme,
+                    "kiss",
+                    ex.mesh_serial_port.as_deref(),
+                    ex.mesh_baud_rate,
+                );
+                (ct, sp, br, None)
+            }
             _ => {
                 let addr: String = Input::with_theme(&theme)
                     .with_prompt("pymc_core address")
@@ -825,6 +845,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
             0 => {
                 let (ct, sp, br) = configure_serial(
                     &theme,
+                    "serial",
                     ex.meshtastic_serial_port.as_deref(),
                     ex.meshtastic_baud_rate,
                 );
@@ -1307,8 +1328,14 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
 // ── Connection type configuration ─────────────────────────────────────────────
 
+/// Ask for a serial port and baud rate, returning them under `connection_type`.
+///
+/// Companion firmware and KISS Modem firmware are both reached over a USB
+/// serial port and differ only in what the BBS speaks down it, so the prompts
+/// are shared and the caller supplies the `connection_type` to record.
 fn configure_serial(
     theme: &ColorfulTheme,
+    connection_type: &'static str,
     existing_port: Option<&str>,
     existing_baud: u32,
 ) -> (&'static str, Option<String>, Option<u32>) {
@@ -1368,7 +1395,7 @@ fn configure_serial(
 
     let baud: u32 = baud_str.parse().expect("validated above");
 
-    ("serial", Some(serial_port), Some(baud))
+    (connection_type, Some(serial_port), Some(baud))
 }
 
 fn configure_uart_hat(theme: &ColorfulTheme, existing_port: Option<&str>) -> (String, u32) {
@@ -2134,8 +2161,11 @@ fn print_next_steps(
         println!();
     }
 
+    // Every connection type that opens a device node needs the same udev or
+    // group access, so each new one belongs here. A KISS Modem reaches the
+    // radio over the same USB serial port a companion device does.
     let needs_serial_access = cfg!(target_os = "linux")
-        && ((use_mesh && mesh_conn_type == "serial")
+        && ((use_mesh && matches!(mesh_conn_type, "serial" | "kiss"))
             || (use_meshtastic && matches!(meshtastic_conn_type, "serial" | "hat")));
 
     if needs_serial_access {
@@ -2152,7 +2182,7 @@ fn print_next_steps(
         println!("  ls -l <port>                          # shows the owning group");
         println!("  sudo usermod -aG <group> supply-drop  # then restart the service");
         println!();
-        if use_mesh && mesh_conn_type == "serial" {
+        if use_mesh && matches!(mesh_conn_type, "serial" | "kiss") {
             if let Some(port) = mesh_serial_port {
                 println!("Verify MeshCore port access with:");
                 println!("  ls -l {port}");
@@ -2173,6 +2203,22 @@ fn print_next_steps(
         println!();
         println!("  To restore or migrate to a new 64-char hex key:");
         println!("    supply-drop-bbs node import-key <64-char-hex>");
+        println!();
+        println!("  The BBS service must not be running when using these commands.");
+        println!();
+    }
+
+    // A KISS Modem node has a key but no way to read or replace it, so only
+    // show-key is offered (ADR-0014).
+    if use_mesh && mesh_conn_type == "kiss" {
+        println!("MeshCore node key:");
+        println!();
+        println!("  To see the current node key (public key):");
+        println!("    supply-drop-bbs node show-key");
+        println!();
+        println!("  This node's identity lives in the device's flash and the KISS Modem");
+        println!("  firmware cannot export it, so it cannot be backed up or moved to a");
+        println!("  replacement board. Reflashing the device gives the BBS a new identity.");
         println!();
         println!("  The BBS service must not be running when using these commands.");
         println!();

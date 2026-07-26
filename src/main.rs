@@ -2095,6 +2095,39 @@ async fn cmd_node_meshtastic(config_path: Option<&std::path::Path>, action: Node
     }
 }
 
+/// A `node`-subcommand connection to the radio.
+///
+/// Both backends emit `ClientEvent` and accept `OutboundFrame`, so the command
+/// loop below does not know which one it opened. This mirrors `bbs-mesh`'s
+/// `RadioLink`, which does the same job for the running transport.
+#[cfg(feature = "transport-mesh")]
+enum NodeLink {
+    /// A companion-frame connection over USB serial.
+    Companion(meshcore_companion::client::CompanionClient),
+    /// A KISS Modem connection over USB serial.
+    Kiss(meshcore_kiss::client::KissClient),
+}
+
+#[cfg(feature = "transport-mesh")]
+impl NodeLink {
+    async fn send(
+        &self,
+        frame: meshcore_companion::frame::OutboundFrame,
+    ) -> Result<(), meshcore_companion::client::SendError> {
+        match self {
+            Self::Companion(client) => client.send(frame).await,
+            Self::Kiss(client) => client.send(frame).await,
+        }
+    }
+
+    async fn recv(&mut self) -> Option<meshcore_companion::client::ClientEvent> {
+        match self {
+            Self::Companion(client) => client.recv().await,
+            Self::Kiss(client) => client.recv().await,
+        }
+    }
+}
+
 async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
     // ── Meshtastic node commands ──────────────────────────────────────────────
     #[cfg(feature = "transport-meshtastic")]
@@ -2155,18 +2188,34 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
             _ => unreachable!("Meshtastic commands should have been handled above"),
         };
 
-        let port = match port_flag.or_else(|| {
-            if mesh_cfg.connection_type == bbs_mesh::config::ConnectionType::Serial {
-                mesh_cfg.serial_port.clone()
-            } else {
-                None
+        // A KISS Modem device keeps its identity in flash and the firmware
+        // exposes no private-key export, so there is nothing for these two
+        // commands to act on. Refuse before opening the port rather than
+        // speaking companion frames at a TNC and timing out (ADR-0014).
+        let kiss = mesh_cfg.connection_type == bbs_mesh::config::ConnectionType::Kiss;
+        if kiss {
+            if let NodeAction::ExportKey { .. } | NodeAction::ImportKey { .. } = &action {
+                eprintln!(
+                    "error: a KISS Modem node's identity cannot be exported or imported.\n\
+                     The key lives in the device's flash and the KISS firmware exposes no\n\
+                     way to read or replace it, so it cannot be backed up or moved to another\n\
+                     board. See docs/adr/0014-native-meshcore-stack-for-kiss-modems.md."
+                );
+                std::process::exit(1);
             }
+        }
+
+        let port = match port_flag.or_else(|| match mesh_cfg.connection_type {
+            bbs_mesh::config::ConnectionType::Serial | bbs_mesh::config::ConnectionType::Kiss => {
+                mesh_cfg.serial_port.clone()
+            }
+            _ => None,
         }) {
             Some(p) => p,
             None => {
                 eprintln!(
                     "error: no serial port specified. Use --port or set [plugins.mesh] \
-                     connection_type = \"serial\" and serial_port in config.toml"
+                     connection_type = \"serial\" (or \"kiss\") and serial_port in config.toml"
                 );
                 std::process::exit(1);
             }
@@ -2273,16 +2322,31 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
             _ => unreachable!("Meshtastic commands should have been handled above"),
         };
 
-        let serial_cfg = SerialConfig {
-            port,
-            baud_rate: baud,
-            app_target_version: APP_TARGET_VER_V3,
-            // Don't retry on CLI — if the port is unavailable, fail fast.
-            reconnect_delay_initial: Duration::from_secs(60),
-            reconnect_delay_max: Duration::from_secs(60),
-        };
+        // Don't retry on CLI — if the port is unavailable, fail fast and let
+        // the operation timeout below report it.
+        const NO_RETRY: Duration = Duration::from_secs(60);
 
-        let mut client = CompanionClient::connect_serial(serial_cfg);
+        let mut client = if kiss {
+            // A one-shot command sends no traffic of its own, so the node stack
+            // is left without a contact file to rewrite and without a flood
+            // scope to derive. The path-hash width still comes from config:
+            // traffic can arrive while the port is open, and the acknowledgement
+            // the node sends back must use the width the mesh is running.
+            let mut kiss_cfg = meshcore_kiss::client::KissClientConfig::new(port);
+            kiss_cfg.baud_rate = baud;
+            kiss_cfg.path_bytes = mesh_cfg.path_hash_mode() + 1;
+            kiss_cfg.reconnect_delay_initial = NO_RETRY;
+            kiss_cfg.reconnect_delay_max = NO_RETRY;
+            NodeLink::Kiss(meshcore_kiss::client::KissClient::connect(kiss_cfg))
+        } else {
+            NodeLink::Companion(CompanionClient::connect_serial(SerialConfig {
+                port,
+                baud_rate: baud,
+                app_target_version: APP_TARGET_VER_V3,
+                reconnect_delay_initial: NO_RETRY,
+                reconnect_delay_max: NO_RETRY,
+            }))
+        };
 
         // ── Wait up to 15 s for the whole operation ───────────────────────
         let result = timeout(Duration::from_secs(15), async {
